@@ -1,7 +1,7 @@
 # AI对冲基金系统 - 技术文档
 
-> 版本: 2026.5.14
-> 生成日期: 2026-06-16
+> 版本: 2026.7.10
+> 生成日期: 2026-07-13
 > 项目: AI Hedge Fund - 教育性质的AI驱动对冲基金系统
 
 ---
@@ -175,7 +175,14 @@
 
 ### 1.6 版本历史
 
-- **v2026.5.14** (当前版本)
+- **v2026.7.10** (当前版本)
+  - v2/ 模块新增 `signals/`（`AlphaModel`/`QuantModel`/`LLMAgent` 接口，`BuffettAgent`、`PEADModel` 实现）与 `llm/`（`LLMClient` 协议、`AnthropicLLM`、`PromptCache`）
+  - v2/ 新增 `features/snapshot.py`（`FundamentalsSnapshot` 时点正确基本面快照）、`data/cached.py`（`CachedDataClient` 磁盘缓存）、`demo/`（PEAD 回测演示仪表盘）、`analyze.py`（分析师时点观点 CLI）
+  - v2 数据层改为 fail-loud 契约：基础设施故障抛出 `FDClientError`，不再静默返回空值；`get_financial_metrics` 改按 `filing_date_lte` 时点过滤
+  - v2 回测引擎删除旧的 `Strategy`/`PEADStrategy`/`TradeSignal` 架构，改为 `BacktestEngine.run_alpha()` 直接驱动 `AlphaModel`
+  - 新增 `ROADMAP.md`、`VISION.md`（v2 路线图与愿景文档）
+
+- **v2026.5.14**
   - 添加 Nassim Taleb 黑天鹅风险分析师Agent
   - 添加 v2/ 高级模块（回测、事件研究、信号、风险等）
   - 更新模型支持（Fable 5, Opus 4.8, Grok 4.3, DeepSeek V4 Pro, GPT-5.5, Kimi K2.6, Gemini 3.1 Pro）
@@ -257,17 +264,20 @@ ai-hedge-fund/
 │   │   └── database/             # 数据库配置
 │   └── frontend/                 # React前端
 │       └── src/
-├── v2/                            # 高级量化模块（独立于src/）
-│   ├── backtesting/               # 新一代回测系统
-│   ├── data/                      # 数据层（行情、基本面数据源）
-│   ├── event_study/                # 事件研究系统
-│   ├── features/                  # 特征工程
-│   ├── pipeline/                  # 数据/信号处理管道
-│   ├── portfolio/                 # 组合构建与管理
-│   ├── risk/                      # 风险模型
-│   ├── signals/                   # 信号生成
-│   ├── validation/                # 验证与测试工具
-│   └── models.py                  # v2公共数据模型
+├── v2/                            # 对冲基金核心引擎重建（与src/并行开发，尚未接入app/）
+│   ├── data/                      # 数据层：FDClient（fail-loud）、CachedDataClient、DataClient协议
+│   ├── signals/                   # AlphaModel接口 + 量化/LLM分析师（QuantModel、LLMAgent、BuffettAgent、PEADModel）
+│   ├── llm/                       # LLM提供商层：LLMClient协议、AnthropicLLM、PromptCache
+│   ├── features/                  # 特征工程：FundamentalsSnapshot（时点正确基本面快照）
+│   ├── backtesting/                # 回测引擎：BacktestEngine.run_alpha()（Alpha模型无关）
+│   ├── event_study/                # 事件研究系统：compute_car()
+│   ├── demo/                       # 演示仪表盘（PEAD回测终端实时展示）
+│   ├── analyze.py                  # CLI：向任意分析师询问某只股票的时点观点
+│   ├── pipeline/                  # 数据/信号处理管道（规划中）
+│   ├── portfolio/                 # 组合构建与管理（规划中）
+│   ├── risk/                      # 风险模型（规划中）
+│   ├── validation/                # 验证与测试工具（规划中）
+│   └── models.py                  # v2公共数据模型（Signal、QuantSignals等）
 ├── tests/                        # 测试代码
 │   └── fixtures/                 # 测试数据
 ├── docker/                       # Docker配置

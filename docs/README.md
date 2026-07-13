@@ -56,19 +56,34 @@ ai-hedge-fund/
 │       ├── cli.py                # 回测 CLI 参数解析
 │       ├── types.py              # 回测类型定义
 │       └── valuation.py          # 回测估值工具
-├── v2/                           # 事件研究与策略回测框架（v2）
+├── v2/                           # 对冲基金核心引擎重建（v2，与 v1 并行开发，尚未接入 app/）
 │   ├── data/
-│   │   ├── client.py             # FDClient（类型化 API 客户端，支持上下文管理器）
+│   │   ├── client.py             # FDClient（类型化 API 客户端，fail-loud，支持上下文管理器）
+│   │   ├── cached.py             # CachedDataClient（磁盘缓存包装器，.v2_cache/data/）
+│   │   ├── protocol.py           # DataClient 协议（结构化子类型，解耦具体数据源）
 │   │   └── models.py             # Pydantic 数据模型（含 EarningsRecord 等）
+│   ├── signals/                  # AlphaModel 接口 + 量化/LLM 分析师实现
+│   │   ├── base.py               # AlphaModel（ABC）、QuantModel
+│   │   ├── llm_agent.py          # LLMAgent（LLM 投资人 Agent 公共基类）
+│   │   ├── buffett.py            # BuffettAgent（Warren Buffett 人格）
+│   │   └── pead.py               # PEADModel（盈余公告后漂移量化模型）
+│   ├── llm/                      # LLM 提供商层（镜像 data/protocol.py 的解耦方式）
+│   │   ├── client.py             # LLMClient 协议 + AnthropicLLM 实现
+│   │   └── cache.py              # PromptCache（LLM 决策磁盘缓存，.v2_cache/llm/）
+│   ├── features/
+│   │   └── snapshot.py           # FundamentalsSnapshot（LLM Agent 的时点正确输入）
 │   ├── event_study/
 │   │   ├── engine.py             # compute_car() 事件研究主入口
 │   │   ├── models.py             # EventCAR, EventStudyResult 等 Pydantic 模型
 │   │   ├── stats.py              # fit_market_model, bootstrap_ci 等统计函数
 │   │   └── plot.py               # CAR 可视化图表（matplotlib）
-│   └── backtesting/
-│       ├── engine.py             # BacktestEngine（策略无关回测引擎）
-│       ├── models.py             # TradeSignal, Trade, PerformanceMetrics 等
-│       └── strategy.py           # Strategy ABC + PEADStrategy 实现
+│   ├── backtesting/
+│   │   ├── engine.py             # BacktestEngine.run_alpha()（Alpha 模型无关回测引擎）
+│   │   └── models.py             # Trade, PerformanceMetrics, BacktestResult
+│   ├── demo/
+│   │   └── backtest.py           # PEAD 回测演示仪表盘（终端实时展示）
+│   ├── analyze.py                # CLI：向任意分析师询问某只股票的时点观点
+│   └── models.py                 # Signal, QuantSignals 等顶层 Pydantic 模型
 ├── app/
 │   ├── backend/                  # FastAPI 后端
 │   │   ├── main.py               # FastAPI 应用入口
@@ -380,6 +395,23 @@ poetry run python src/main.py --ticker AAPL --show-reasoning
 poetry run python src/backtester.py --ticker AAPL,MSFT,NVDA
 ```
 
+### v2 CLI（独立于 src/，见 [v2_signals_system.md](v2_signals_system.md)）
+
+```bash
+# 向某位分析师询问某只股票的时点观点
+poetry run python -m v2.analyze NVDA
+poetry run python -m v2.analyze NVDA --date 2024-06-01 --agent pead
+
+# PEAD 回测演示仪表盘（终端实时展示，预热缓存后可离线运行）
+poetry run python -m v2.demo.backtest
+
+# PEAD 回测（100 只股票池）
+poetry run python -m v2.backtesting
+
+# v2 测试
+poetry run pytest v2/
+```
+
 ### Web 后端
 
 ```bash
@@ -451,9 +483,10 @@ poetry run pytest -k "test_name"                       # 按名称运行测试
 - [backtest_system.md](backtest_system.md) — src/ 回测系统详细说明
 
 ### v2 模块文档
-- [v2_data_layer.md](v2_data_layer.md) — v2 数据层（FDClient、Pydantic 模型、速率限制）
+- [v2_data_layer.md](v2_data_layer.md) — v2 数据层（FDClient、FDClientError、CachedDataClient、Pydantic 模型、时点过滤）
+- [v2_signals_system.md](v2_signals_system.md) — v2 Alpha 模型与 LLM 投资人系统（AlphaModel、LLMAgent、BuffettAgent、PEADModel、v2/llm/、FundamentalsSnapshot）
 - [v2_event_study_system.md](v2_event_study_system.md) — v2 事件研究框架（compute_car、市场模型、统计检验、可视化）
-- [v2_backtesting_system.md](v2_backtesting_system.md) — v2 策略回测引擎（BacktestEngine、PEADStrategy、绩效指标）
+- [v2_backtesting_system.md](v2_backtesting_system.md) — v2 回测引擎（BacktestEngine.run_alpha、绩效指标）
 
 ### 分析师 Agent 文档
 - [portfolio_manager_agent.md](portfolio_manager_agent.md) — 投资组合管理 Agent

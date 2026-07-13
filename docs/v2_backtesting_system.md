@@ -8,27 +8,28 @@
 
 ### 1.1 核心功能
 
-v2 回测系统是一个**策略无关（Strategy-Agnostic）**的交易模拟引擎。策略负责生成 `TradeSignal` 信号列表；引擎接管一切后续工作——价格查询、仓位大小计算、盈亏结算、权益曲线构建与绩效指标计算。
+v2 回测系统是一个**Alpha 模型无关（Alpha-Model-Agnostic）**的交易模拟引擎。引擎直接驱动任意 `AlphaModel`（定义于 `v2/signals/base.py`，量化模型与 LLM 投资人 Agent 的共同接口）在历史交易日网格上逐日形成观点（`Signal`），并接管一切后续工作——价格查询、入场时机判断、仓位大小计算、盈亏结算、权益曲线构建与绩效指标计算。
 
-相较于 v1 的逐日驱动 AI Agent 模式，v2 采用"信号先行、执行分离"的架构：策略可以独立测试和组合，引擎无需感知策略内部逻辑。
+> **架构变更提示**：早期版本的 v2 回测系统曾采用 `Strategy` 抽象基类 + `PEADStrategy` + `TradeSignal` 的"批量生成信号 → 引擎执行"两阶段架构（`v2/backtesting/strategy.py`）。该文件已被删除，取而代之的是与 `v2/signals/` 模块共享的 `AlphaModel` 接口——量化模型（`QuantModel`，如 `PEADModel`）与 LLM 投资人 Agent（`LLMAgent`，如 `BuffettAgent`）现在使用同一套接口、同一个回测引擎，无需再为每种模型单独适配"生成信号"逻辑。
 
 ### 1.2 设计目标
 
-- 策略层与执行层解耦：策略只生成信号，不负责任何价格或资金操作
+- **观点与执行分离**：`AlphaModel.predict(ticker, date, data_client)` 只负责形成观点（`Signal`，`[-1, +1]` 区间的信念值），不涉及任何价格或资金操作；引擎逐日调用该接口并自行决定何时开仓、平仓
 - 等额美元仓位管理（Equal-Dollar Position Sizing），简单可比
 - 支持多空两个方向
-- 自动快照入场日（Snap to next trading day）处理非交易日
-- 内置 PEAD（Post-Earnings Announcement Drift）策略作为参考实现
+- 边沿触发（Edge-Triggered）开仓：只有当模型的观点从"无信号"重新转为"有信号"时才开新仓，避免同一信号窗口内重复开仓
+- 同一套引擎既可驱动纯数学的量化模型（`PEADModel`），也可驱动调用 LLM 的投资人 Agent（`BuffettAgent`）
 
 ### 1.3 模块文件清单
 
 | 文件 | 职责 |
 |------|------|
 | `v2/backtesting/engine.py` | `BacktestEngine` 核心引擎类 |
-| `v2/backtesting/models.py` | Pydantic 数据模型：`TradeSignal`、`Trade`、`PerformanceMetrics`、`BacktestResult` |
-| `v2/backtesting/strategy.py` | `Strategy` 抽象基类 + `PEADStrategy` 实现 |
-| `v2/backtesting/__main__.py` | CLI 入口，`poetry run python -m v2.backtesting` |
+| `v2/backtesting/models.py` | Pydantic 数据模型：`Trade`、`PerformanceMetrics`、`BacktestResult` |
+| `v2/backtesting/__main__.py` | CLI 入口，`poetry run python -m v2.backtesting`（PEAD 演示） |
 | `v2/backtesting/__init__.py` | 公开导出所有主要类 |
+
+`AlphaModel`、`QuantModel`、`LLMAgent`、`PEADModel`、`BuffettAgent`、`Signal` 已迁移至 `v2/signals/` 与顶层 `v2/models.py`，详见 [`v2_signals_system.md`](./v2_signals_system.md)。
 
 ### 1.4 公开导出（`__init__.py`）
 
@@ -37,10 +38,7 @@ from v2.backtesting import (
     BacktestEngine,
     BacktestResult,
     PerformanceMetrics,
-    PEADStrategy,
-    Strategy,
     Trade,
-    TradeSignal,
 )
 ```
 
@@ -49,23 +47,25 @@ from v2.backtesting import (
 ```
 CLI / 调用方
     |
-    +-- FDClient（数据层）
+    +-- DataClient（数据层，FDClient 或 CachedDataClient）
     |
-Strategy.generate_signals(tickers, fd_client)
-    |  -> list[TradeSignal]
+    +-- AlphaModel 实例（PEADModel、BuffettAgent 等，来自 v2.signals）
     |
-BacktestEngine.run(strategy, tickers, fd_client)
+BacktestEngine.run_alpha(model, tickers, data_client, start_date, end_date, ...)
     |
-    +-- run_signals(signals, fd_client)
+    +-- _trade_ticker(model, ticker, data_client, ...)  # 对每只股票独立执行
          |
-         +-- _fill_signal(signal, fd_client)  -> Trade | None
-         |    (逐信号：查价格 → 快照入场日 → 计算退出日 → 计算P&L)
+         +-- 逐交易日调用 model.predict(ticker, date, data_client)  -> Signal
+         |    （边沿触发：只在从"无观点"转为"有观点"时开仓）
          |
-         +-- _build_equity_curve(trades)  -> list[float]
+         +-- _build_trade(...)  -> Trade | None
+         |    （按 holding_days 计算退出日，等额美元定价）
          |
-         +-- _compute_metrics(trades, equity_curve)  -> PerformanceMetrics
-         |
-         -> BacktestResult
+    +-- _build_equity_curve(trades)  -> list[float]
+    |
+    +-- _compute_metrics(trades, equity_curve)  -> PerformanceMetrics
+    |
+    -> BacktestResult
 ```
 
 ---
@@ -77,42 +77,29 @@ BacktestEngine.run(strategy, tickers, fd_client)
 | 方法 | 签名 | 说明 |
 |------|------|------|
 | `__init__` | `(*, capital=100_000.0, per_trade=10_000.0) -> None` | 引擎构造函数，所有参数为关键字参数 |
-| `run` | `(strategy, tickers, fd_client) -> BacktestResult` | 完整管线：生成信号后执行回测 |
-| `run_signals` | `(signals, fd_client) -> BacktestResult` | 直接执行预构建信号列表 |
-| `_fill_signal` | `(signal, fd_client) -> Trade \| None` | 将单条信号转换为成交交易（私有） |
-| `_build_equity_curve` | `(trades) -> list[float]` | 构建权益曲线（私有） |
-| `_compute_metrics` | `(trades, equity_curve) -> PerformanceMetrics` | 计算统计绩效指标（私有） |
+| `run_alpha` | `(model, tickers, data_client, start_date, end_date, *, threshold=0.0, holding_days=5) -> BacktestResult` | 唯一的公开入口：驱动 `AlphaModel` 逐日形成观点并执行回测 |
+| `_trade_ticker` | `(model, ticker, data_client, start_date, end_date, *, threshold, holding_days) -> list[Trade]`（私有） | 对单只股票走完整交易日网格，开仓/平仓 |
+| `_build_trade` | `(ticker, direction, entry_date, exit_date, price_map, holding_days, reasoning, metadata) -> Trade \| None`（私有） | 将一次开平仓事件转换为成交 `Trade` |
+| `_build_equity_curve` | `(trades) -> list[float]`（私有） | 构建权益曲线 |
+| `_compute_metrics` | `(trades, equity_curve) -> PerformanceMetrics`（私有） | 计算统计绩效指标 |
 
 **模块级辅助函数**（位于 `engine.py` 文件末尾）：
 
 | 函数 | 签名 | 说明 |
 |------|------|------|
 | `_parse_date` | `(s: str) -> date` | 将 `YYYY-MM-DD` 字符串解析为 `date` 对象，取前 10 字符 |
-| `_find_next_trading_day` | `(date_str, trading_days) -> str \| None` | 从有序交易日列表中找到第一个 `>= date_str` 的日期 |
 
-### 2.2 `Strategy` 抽象基类（`strategy.py`）
+> `run`、`run_signals`、`_fill_signal`、`_find_next_trading_day` 等方法（旧 `Strategy` 架构下的方法名）已不存在——引擎不再区分"生成信号"和"执行信号"两个阶段，`run_alpha` 内部直接逐日调用 `model.predict()`。
 
-| 成员 | 类型 | 说明 |
-|------|------|------|
-| `name` | `@property @abstractmethod -> str` | 策略的人类可读名称 |
-| `generate_signals` | `@abstractmethod (tickers, fd_client) -> list[TradeSignal]` | 扫描历史数据，输出信号列表 |
-
-### 2.3 `PEADStrategy`（`strategy.py`）
-
-| 成员 | 类型 | 说明 |
-|------|------|------|
-| `__init__` | `(*, earnings_limit=8, holding_days=5) -> None` | 关键字参数构造，`earnings_limit` 控制每个 ticker 拉取多少期财报 |
-| `name` | `str` | 固定返回 `"pead"` |
-| `generate_signals` | `(tickers, fd_client) -> list[TradeSignal]` | 扫描盈余惊喜历史，生成多/空信号 |
-
-### 2.4 Pydantic 模型（`models.py`）
+### 2.2 Pydantic 模型（`models.py`）
 
 | 类 | 字段 |
 |----|------|
-| `TradeSignal` | `ticker`, `direction`, `entry_date`, `holding_days`, `metadata` |
-| `Trade` | `ticker`, `direction`, `entry_date`, `exit_date`, `entry_price`, `exit_price`, `shares`, `pnl`, `return_pct`, `holding_days`, `metadata` |
+| `Trade` | `ticker`, `direction`, `entry_date`, `exit_date`, `entry_price`, `exit_price`, `shares`, `pnl`, `return_pct`, `holding_days`, `reasoning`, `metadata` |
 | `PerformanceMetrics` | `total_return_pct`, `annualized_return_pct`, `sharpe_ratio`, `max_drawdown_pct`, `win_rate`, `n_trades`, `n_long`, `n_short`, `avg_return_pct`, `avg_holding_days` |
 | `BacktestResult` | `trades`, `metrics`, `equity_curve` |
+
+> `TradeSignal` 模型已删除——`AlphaModel.predict()` 的返回类型是 `v2.models.Signal`（跨 `v2/signals/`、`v2/backtesting/` 共用），不再是回测子模块私有的信号类型。
 
 ---
 
@@ -131,61 +118,85 @@ engine = BacktestEngine(capital=100_000.0, per_trade=10_000.0)
 
 ---
 
-### 3.2 `BacktestEngine.run`
+### 3.2 `BacktestEngine.run_alpha`
 
 ```python
-result = engine.run(strategy, ["AAPL", "MSFT"], fd_client)
+result = engine.run_alpha(
+    PEADModel(), ["AAPL", "MSFT"], data_client,
+    "2024-06-01", "2024-12-01", holding_days=5,
+)
 ```
 
-**完整管线**，内部顺序：
-1. 调用 `strategy.generate_signals(tickers, fd_client)` 获取信号列表
-2. 将信号列表交给 `run_signals(signals, fd_client)` 执行
+**唯一的公开入口**，对 `tickers` 中每只股票独立调用 `_trade_ticker`，汇总所有交易后统一计算权益曲线和绩效指标。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model` | `AlphaModel` | — | 待回测的 Alpha 模型实例（如 `PEADModel()`、`BuffettAgent()`） |
+| `tickers` | `list[str]` | — | 回测股票池 |
+| `data_client` | `DataClient` | — | 数据源（`FDClient` 或 `CachedDataClient` 均可） |
+| `start_date` | `str` | — | 信号评估起始日期（`YYYY-MM-DD`） |
+| `end_date` | `str` | — | 信号评估截止日期（`YYYY-MM-DD`） |
+| `threshold` | `float` | `0.0` | 触发交易所需的最小 `\|conviction\|`；`0.0` 表示任何非零观点都会触发 |
+| `holding_days` | `int` | `5` | 每笔持仓的持有交易日数 |
+
+**执行流程**：
+1. 对 `tickers` 中每只股票调用 `_trade_ticker`，收集所有 `Trade`
+2. 若无任何成交，返回空 `BacktestResult()`
+3. 按 `entry_date` 对全部交易排序（升序）
+4. 调用 `_build_equity_curve(trades)` 构建权益曲线
+5. 调用 `_compute_metrics(trades, equity_curve)` 计算绩效
+6. 返回 `BacktestResult(trades=..., metrics=..., equity_curve=...)`
 
 ---
 
-### 3.3 `BacktestEngine.run_signals`
+### 3.3 `BacktestEngine._trade_ticker`
+
+对单只股票走完整交易日网格，逐日调用 `model.predict()` 形成观点，并按边沿触发规则开平仓。
+
+**价格获取窗口（带 padding）**：
 
 ```python
-result = engine.run_signals(signals, fd_client)
+end_padded = end_date + timedelta(days=holding_days * 2 + 10)
+if end_padded > today:
+    end_padded = today
+prices = data_client.get_prices(ticker, start_date, end_padded)
 ```
 
-**直接执行预构建信号列表**，适用于测试、手动信号列表，或多策略信号合并后统一执行。
+向后多取 `holding_days * 2 + 10` 天的价格，确保 `end_date` 附近开仓的交易仍有足够的未来交易日可用于平仓定价；`end_padded` 不超过今日，避免请求未来数据。若该股票无任何价格数据，直接返回空列表。
 
-执行流程：
-1. 若 `signals` 为空，立即返回 `BacktestResult()`（空结果）
-2. 对每条信号调用 `_fill_signal`，收集成功转化为 `Trade` 的结果
-3. 若所有信号均无法成交（`trades` 为空），返回空 `BacktestResult()`
-4. 按 `entry_date` 对交易排序（升序）
-5. 调用 `_build_equity_curve(trades)` 构建权益曲线
-6. 调用 `_compute_metrics(trades, equity_curve)` 计算绩效
-7. 返回 `BacktestResult(trades=..., metrics=..., equity_curve=...)`
+**交易日网格**：
+
+```python
+all_days = sorted(price_map)                                    # 价格序列覆盖的全部交易日（含 padding）
+grid = [d for d in all_days if start_date <= d <= end_date]      # 实际逐日评估信号的范围
+```
+
+**边沿触发开仓（Edge-Triggered Arming）**：
+
+引擎维护一个 `armed` 布尔标志（初始为 `True`）：
+
+- 仅当 `armed=True` 且 `abs(signal.value) > threshold` 时才开新仓；开仓后立即将 `armed` 置为 `False`
+- 只有当某一天的信号重新回落到 `abs(signal.value) <= threshold`（"无观点"）时，才将 `armed` 重新置为 `True`
+
+这确保了同一次持续信号（如连续多天维持看多）不会被反复开仓；模型必须先"归零"，再重新触发，才会形成第二笔交易。
+
+**开仓与跳过持有期**：
+
+```python
+direction = "long" if signal.value > 0 else "short"
+entry_idx = all_days.index(d)
+exit_idx = entry_idx + holding_days
+if exit_idx >= len(all_days):
+    break   # 剩余价格数据不足以平仓，终止该股票的扫描
+```
+
+开仓后，网格指针直接跳到平仓日（`all_days[exit_idx]`）对应的位置继续扫描，不会在持仓期间的每一天重复评估信号（也就不会产生重叠仓位）。
 
 ---
 
-### 3.4 `BacktestEngine._fill_signal`
+### 3.4 `BacktestEngine._build_trade`
 
-将单条 `TradeSignal` 转换为实际成交的 `Trade`，或在无法成交时返回 `None`。
-
-**价格获取窗口**：
-
-```python
-price_start = entry - timedelta(days=5)           # 入场日前 5 日
-price_end   = entry + timedelta(days=holding_days * 2 + 10)  # 宽余窗口
-```
-
-若 `price_end` 超过今日（`date.today()`），自动截断为今日，防止请求未来数据。
-
-**入场日快照（Snap to Next Trading Day）**：
-
-调用 `_find_next_trading_day(signal.entry_date, trading_days)`，找到价格序列中第一个 `>= signal.entry_date` 的实际交易日作为入场日。若在价格序列范围内找不到有效入场日，返回 `None`，该信号被丢弃。
-
-**退出日计算**：
-
-```python
-exit_idx = entry_idx + signal.holding_days
-```
-
-以入场日在有序交易日列表中的索引为基准，向后偏移 `holding_days` 个交易日。若 `exit_idx >= len(trading_days)`（价格数据不足），返回 `None`。
+将一次开平仓事件（entry_date、exit_date、direction）转换为成交的 `Trade`，或在价格缺失时返回 `None`。
 
 **仓位大小（Equal-Dollar Sizing）**：
 
@@ -204,7 +215,7 @@ shares = self._per_trade / entry_price
 
 `pnl` 四舍五入到 2 位小数，`return_pct` 四舍五入到 6 位小数。
 
-**返回字段**：完整填充的 `Trade` 对象，`metadata` 从 `signal.metadata` 继承。
+**返回字段**：完整填充的 `Trade` 对象；`reasoning` 与 `metadata` 直接取自触发该笔交易的 `Signal.reasoning` / `Signal.metadata`（例如 PEAD 模型会带上 `eps_surprise`、`source_type`、`report_period`；LLM Agent 会带上 `confidence`、`model`、`cached` 等）。
 
 ---
 
@@ -243,63 +254,13 @@ for t in trades:
 | `avg_return_pct` | 所有交易 `return_pct` 的算术平均 |
 | `avg_holding_days` | 所有交易 `holding_days` 的算术平均，四舍五入到 1 位小数 |
 
----
-
-### 3.7 `Strategy` 抽象基类
-
-自定义策略只需：
-1. 继承 `Strategy`
-2. 实现 `name` 属性
-3. 实现 `generate_signals(tickers, fd_client) -> list[TradeSignal]`
-
-信号顺序不重要，引擎会按 `entry_date` 排序。
-
----
-
-### 3.8 `PEADStrategy.generate_signals`
-
-对每个 ticker：
-1. 调用 `fd_client.get_earnings_history(ticker, limit=self._earnings_limit)` 获取财报历史
-2. 过滤：跳过 `filing_date` 或 `quarterly` 为空的记录；跳过 `eps_surprise` 不为 `"BEAT"` 或 `"MISS"` 的记录
-3. **45 天过滤**：若 `(filing_date - report_period).days >= 45`，跳过该记录（过晚披露的财报不具备 PEAD 效应）
-4. **去重（每个 `report_period` 只保留最优先的一条）**：以 `f"{ticker}:{report_period}"` 为键，按 `source_type` 优先级取最优记录
-
-   | source_type | 优先级值（越小越优先） |
-   |-------------|----------------------|
-   | `8-K` | 0 |
-   | `10-Q` | 1 |
-   | `10-K` | 2 |
-   | `20-F` | 3 |
-   | 其他 | 99 |
-
-5. 生成 `TradeSignal`：
-
-   | 盈余惊喜 | 方向 | `entry_date` |
-   |---------|------|--------------|
-   | `BEAT` | `long` | `record.filing_date` |
-   | `MISS` | `short` | `record.filing_date` |
-
-   `metadata` 中记录 `eps_surprise`、`source_type`、`report_period`。引擎会将 `entry_date` 快照到下一个实际交易日。
+（这套计算逻辑与旧版 `Strategy` 架构完全一致，未随本次重构改变。）
 
 ---
 
 ## 4. Pydantic 模型详解
 
-### 4.1 `TradeSignal`
-
-策略发出的入场指令。引擎处理一切执行细节，策略无需关心价格和资金。
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `ticker` | `str` | 股票代码，如 `"AAPL"` |
-| `direction` | `str` | `"long"` 或 `"short"` |
-| `entry_date` | `str` | 期望入场日期，格式 `YYYY-MM-DD`；引擎自动快照到下一个交易日 |
-| `holding_days` | `int` | 持有的**交易日**数量（非自然日） |
-| `metadata` | `dict[str, Any]` | 策略自定义上下文，默认空字典，传递至 `Trade.metadata` |
-
----
-
-### 4.2 `Trade`
+### 4.1 `Trade`
 
 一笔已完成交易的完整记录。
 
@@ -307,7 +268,7 @@ for t in trades:
 |------|------|------|
 | `ticker` | `str` | 股票代码 |
 | `direction` | `str` | `"long"` 或 `"short"` |
-| `entry_date` | `str` | 实际入场日期（快照后），格式 `YYYY-MM-DD` |
+| `entry_date` | `str` | 实际入场日期，格式 `YYYY-MM-DD` |
 | `exit_date` | `str` | 实际退出日期，格式 `YYYY-MM-DD` |
 | `entry_price` | `float` | 入场价（收盘价） |
 | `exit_price` | `float` | 退出价（收盘价） |
@@ -315,11 +276,12 @@ for t in trades:
 | `pnl` | `float` | 美元盈亏（精确到 2 位小数） |
 | `return_pct` | `float` | 百分比收益率（精确到 6 位小数，带符号） |
 | `holding_days` | `int` | 实际持有交易日数 |
-| `metadata` | `dict[str, Any]` | 来自对应 `TradeSignal.metadata`，默认空字典 |
+| `reasoning` | `str \| None` | 触发该笔交易的 `Signal.reasoning`（Alpha 模型给出的理由；LLM Agent 场景下是持仓论点） |
+| `metadata` | `dict[str, Any]` | 来自 `Signal.metadata`，默认空字典（Alpha 模型自定义上下文） |
 
 ---
 
-### 4.3 `PerformanceMetrics`
+### 4.2 `PerformanceMetrics`
 
 一组交易的汇总统计。所有字段均为非 Optional 的 `float` 或 `int`（Pydantic `BaseModel`，无 `total=False`）。
 
@@ -338,57 +300,25 @@ for t in trades:
 
 ---
 
-### 4.4 `BacktestResult`
+### 4.3 `BacktestResult`
 
 引擎返回的顶层结果对象。
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `trades` | `list[Trade]` | `[]` | 所有成交交易，按 `entry_date` 升序排列 |
-| `metrics` | `PerformanceMetrics \| None` | `None` | 信号为空或所有信号均无法成交时为 `None` |
+| `metrics` | `PerformanceMetrics \| None` | `None` | 无任何成交交易时为 `None` |
 | `equity_curve` | `list[float]` | `[]` | 权益曲线，长度 = `n_trades + 1`，首元素为初始资金 |
 
 ---
 
-## 5. 信号生成——PEAD 策略详解
+## 5. 用 PEAD 模型驱动回测
 
-### 5.1 策略原理
+`PEADModel`（`v2/signals/pead.py`）是引擎最初的参考实现，详细的信号生成逻辑（EPS 惊喜方向判定、45 天过滤、多来源去重）已迁移至 [`v2_signals_system.md`](./v2_signals_system.md#pead-模型-v2signalspeadpy) 文档说明。本节仅说明它如何与回测引擎交互：
 
-PEAD（Post-Earnings Announcement Drift，盈余公告后漂移）是一种成熟的市场异常：股价在盈余公告后往往沿惊喜方向持续漂移数天至数周。v2 实现的逻辑：
-- EPS 超预期（BEAT）→ 做多（long）
-- EPS 低于预期（MISS）→ 做空（short）
-
-信号入场日为财报**披露日（filing_date）**，由引擎快照到下一个实际交易日，模拟公告发布后第一个开盘日的操作。
-
-### 5.2 去重逻辑
-
-同一公司同一报告期（`report_period`）可能通过多种文件类型（8-K 紧急公告、10-Q 季报、10-K 年报、20-F 外国私人发行人年报）披露同一财报数据。去重规则：
-
-```
-key = "{ticker}:{report_period}"
-优先保留：8-K（priority=0）> 10-Q（1）> 10-K（2）> 20-F（3）> 其他（99）
-```
-
-只保留每个 key 对应 priority 最小的那条记录，确保使用最早披露的信息，符合实际交易中"首次公告"的时效性。
-
-### 5.3 45 天过滤规则
-
-```python
-if (filing_date - report_period).days >= 45:
-    continue
-```
-
-若披露日与报告期结束日之间超过 45 天，说明该财报为补充披露或修订文件，不具备有效的 PEAD 时效性，予以跳过。
-
-### 5.4 信号 metadata 字段
-
-| key | 值 | 说明 |
-|-----|----|------|
-| `eps_surprise` | `"BEAT"` 或 `"MISS"` | EPS 相对预期的方向 |
-| `source_type` | 如 `"8-K"`、`"10-Q"` | 财报文件类型 |
-| `report_period` | 如 `"2024-09-30"` | 报告期结束日期 |
-
-这些字段在 CLI 输出中用于彩色显示（`BEAT` 绿色，`MISS` 红色）。
+- `PEADModel.predict(ticker, date, data_client)` 若在 `signal_window_days`（默认 4 天）内发现符合条件的最新财报事件，返回 `value = ±1.0`；否则返回 `0.0`（无观点）
+- 引擎按 `threshold=0.0` 的默认设置，任何非零观点都会触发边沿触发开仓逻辑（见 3.3 节）
+- `Signal.metadata` 中的 `eps_surprise`、`source_type`、`report_period` 会原样保存到 `Trade.metadata`，供 CLI 输出彩色展示
 
 ---
 
@@ -457,11 +387,11 @@ win_rate = round(wins / n, 4) if n > 0 else 0.0
 
 以收益率严格大于 0 为胜，不计回报率恰好为 0 的交易（平局）。
 
-### 6.6 价格窗口获取
+### 6.6 价格窗口获取（含 padding）
 
-每条信号独立向 FDClient 请求价格数据，请求窗口：
-- 起点：`entry_date - 5 日`（覆盖入场前的交易日，确保能找到快照点）
-- 终点：`entry_date + holding_days * 2 + 10 日`（覆盖退出日的宽余窗口）
+每只股票独立向 `DataClient` 请求一次价格数据（而非逐信号请求），请求窗口：
+- 起点：`start_date`
+- 终点：`end_date + holding_days * 2 + 10 日`（覆盖回测末尾开仓交易的平仓日）
 - 终点不超过今日（防止请求未来日期）
 
 ### 6.7 仓位等额美元原则
@@ -478,13 +408,17 @@ win_rate = round(wins / n, 4) if n > 0 else 0.0
 poetry run python -m v2.backtesting
 ```
 
+> 另有一个面向演示场景的独立入口 `poetry run python -m v2.demo.backtest`（终端实时仪表盘、25 只股票精选池、可离线重放），详见 [`v2_signals_system.md`](./v2_signals_system.md#demo-展示层-v2demo) 或 `v2/README.md`。两者驱动的都是同一个 `BacktestEngine` + `PEADModel`，区别仅在于展示层与股票池/日期范围的取舍。
+
 ### 7.2 默认参数
 
 | 常量 | 值 | 说明 |
 |------|-----|------|
-| `HOLDING_DAYS` | `5` | PEAD 策略持有交易日数 |
+| `HOLDING_DAYS` | `5` | PEAD 模型持有交易日数 |
 | `CAPITAL` | `100_000.0` | 初始资金 |
 | `PER_TRADE` | `10_000.0` | 每笔交易美元敞口 |
+| `START_DATE` | `"2024-06-01"` | 回测起始日期 |
+| `END_DATE` | `date.today().isoformat()` | 回测截止日期（默认今日） |
 
 ### 7.3 默认股票池（共 100 只）
 
@@ -501,23 +435,19 @@ poetry run python -m v2.backtesting
 
 ### 7.4 执行阶段
 
-**阶段一：扫描财报信号**
+**阶段一：逐股票回测**
 
-逐只股票调用 `PEADStrategy.generate_signals`，终端实时显示进度：
+对每只股票独立调用 `engine.run_alpha(model, [ticker], fd, START_DATE, END_DATE, holding_days=HOLDING_DAYS)`（`model = PEADModel()`），终端实时显示进度：
 
 ```
-  Scanning earnings... [42/100] MSFT
+  Backtesting PEAD alpha... [42/100] MSFT
 ```
 
-完成后显示找到的信号总数。
+完成后显示找到的交易总数。
 
-**阶段二：执行信号**
+**阶段二：逐笔动态展示**
 
-调用 `engine.run_signals(signals, fd)` 批量执行所有信号。
-
-**阶段三：逐笔动态展示**
-
-遍历已排序交易列表，每加入一笔交易后清屏重绘，展示：
+将所有股票产生的交易按 `entry_date` 排序后，逐笔重放：每加入一笔交易后清屏重绘，展示：
 - 顶部面板：组合价值、总收益率、夏普比率、最大回撤、交易笔数、多空分布、胜率、平均收益
 - 交易明细表：按时间序逆序排列（最新在上），包含日期、代码、方向、EPS 惊喜类型、入场价、退出价、持股数、P&L、收益率
 
@@ -535,16 +465,19 @@ poetry run python -m v2.backtesting
 
 ## 8. 使用示例
 
-### 8.1 基本用法
+### 8.1 基本用法（量化模型）
 
 ```python
 from v2.data import FDClient
-from v2.backtesting import BacktestEngine, PEADStrategy
+from v2.backtesting import BacktestEngine
+from v2.signals import PEADModel
 
 with FDClient() as fd:
-    strategy = PEADStrategy(holding_days=5)
     engine = BacktestEngine(capital=100_000, per_trade=10_000)
-    result = engine.run(strategy, ["AAPL", "MSFT", "NVDA"], fd)
+    result = engine.run_alpha(
+        PEADModel(), ["AAPL", "MSFT", "NVDA"], fd,
+        "2024-06-01", "2024-12-01", holding_days=5,
+    )
 
 print(f"总收益率: {result.metrics.total_return_pct:.2%}")
 print(f"夏普比率: {result.metrics.sharpe_ratio:.2f}")
@@ -552,46 +485,37 @@ print(f"最大回撤: {result.metrics.max_drawdown_pct:.2%}")
 print(f"交易笔数: {result.metrics.n_trades}")
 ```
 
-### 8.2 直接执行预构建信号
+### 8.2 使用磁盘缓存加速重跑
 
 ```python
-from v2.backtesting.models import TradeSignal
+from v2.data import CachedDataClient, FDClient
 from v2.backtesting import BacktestEngine
+from v2.signals import PEADModel
 
-signals = [
-    TradeSignal(ticker="AAPL", direction="long", entry_date="2024-02-02", holding_days=5),
-    TradeSignal(ticker="META", direction="short", entry_date="2024-02-29", holding_days=3),
-]
-
-with FDClient() as fd:
-    engine = BacktestEngine(capital=50_000, per_trade=5_000)
-    result = engine.run_signals(signals, fd)
+with FDClient() as raw:
+    fd = CachedDataClient(raw)   # 首次跑真实请求，重跑走磁盘缓存
+    engine = BacktestEngine()
+    result = engine.run_alpha(PEADModel(), ["AAPL"], fd, "2024-01-01", "2024-06-01")
 ```
 
-### 8.3 自定义策略
+### 8.3 自定义 Alpha 模型（量化或 LLM 均可）
 
 ```python
-from v2.backtesting.strategy import Strategy
-from v2.backtesting.models import TradeSignal
+from v2.signals.base import QuantModel
+from v2.models import Signal
 
-class MomentumStrategy(Strategy):
+class MomentumModel(QuantModel):
     @property
     def name(self) -> str:
         return "momentum_52w"
 
-    def generate_signals(self, tickers, fd_client):
-        signals = []
-        for ticker in tickers:
-            # 自定义逻辑：查价格、判断动量、生成信号
-            ...
-            signals.append(TradeSignal(
-                ticker=ticker,
-                direction="long",
-                entry_date="2024-01-15",
-                holding_days=10,
-            ))
-        return signals
+    def predict(self, ticker, date, data_client) -> Signal:
+        # 自定义逻辑：查价格、判断动量、形成观点
+        ...
+        return Signal(model_name=self.name, ticker=ticker, date=date, value=1.0)
 ```
+
+自定义模型只需实现 `AlphaModel.predict(ticker, date, data_client) -> Signal`，即可原样传入 `engine.run_alpha()`，无需修改引擎代码。参见 [`v2_signals_system.md`](./v2_signals_system.md) 了解 `AlphaModel` / `QuantModel` / `LLMAgent` 的完整接口说明。
 
 ---
 
@@ -609,19 +533,19 @@ class MomentumStrategy(Strategy):
 
 | 模块 | 导入项 | 用途 | 调用方 |
 |------|--------|------|--------|
-| `v2.data.client` | `FDClient` | 价格查询（`get_prices`）、财报历史查询（`get_earnings_history`） | `engine.py`, `strategy.py`, `__main__.py` |
-| `v2.data` | `FDClient` | 同上（包级别便捷导入） | `__main__.py` |
-| `v2.backtesting.models` | `TradeSignal`, `Trade`, `PerformanceMetrics`, `BacktestResult` | 数据模型 | `engine.py`, `strategy.py` |
-| `v2.backtesting.strategy` | `Strategy` | 抽象基类 | `engine.py` |
+| `v2.data.protocol` | `DataClient` | 数据提供者协议（引擎不再直接依赖具体的 `FDClient`） | `engine.py` |
+| `v2.data` | `FDClient` | 具体数据源（包级别便捷导入） | `__main__.py` |
+| `v2.signals.base` | `AlphaModel` | Alpha 模型抽象接口 | `engine.py` |
+| `v2.signals` | `PEADModel` | 具体量化模型 | `__main__.py` |
+| `v2.backtesting.models` | `Trade`, `PerformanceMetrics`, `BacktestResult` | 数据模型 | `engine.py` |
 | `v2.backtesting.engine` | `BacktestEngine` | 引擎（CLI 中内部重复导入用于运行时指标计算） | `__main__.py` |
 
 ### 9.3 标准库
 
 | 模块 | 用途 | 所在文件 |
 |------|------|---------|
-| `__future__.annotations` | 延迟类型注解（PEP 563） | `engine.py`, `strategy.py`, `__main__.py` |
-| `abc` | `ABC`、`abstractmethod` | `strategy.py` |
-| `datetime` | `date`、`datetime`、`timedelta` | `engine.py`, `strategy.py` |
+| `__future__.annotations` | 延迟类型注解（PEP 563） | `engine.py`, `__main__.py` |
+| `datetime` | `date`、`datetime`、`timedelta` | `engine.py` |
 | `logging` | 日志记录 | `engine.py`, `__main__.py` |
 | `os` | `os.system("clear")` 用于终端清屏 | `__main__.py` |
 | `sys` | 进度输出（`sys.stdout.write`/`flush`） | `__main__.py` |

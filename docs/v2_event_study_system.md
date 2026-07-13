@@ -21,13 +21,15 @@ v2 事件研究系统围绕财报事件计算**累积异常收益率（CAR，Cum
 
 ### 1.3 系统角色
 
-本模块独立于 LangGraph 多智能体流水线，直接调用 `v2.data.FDClient` 获取价格与财报数据，适合用于离线量化研究与策略验证。
+本模块独立于 LangGraph 多智能体流水线，通过 `v2.data.protocol.DataClient` 协议获取价格与财报数据（生产环境通常传入 `FDClient` 或 `CachedDataClient` 实例），适合用于离线量化研究与策略验证。
+
+> `compute_car()` 的数据源参数已从早期版本的具体类型 `fd_client: FDClient` 改为协议类型 `data_client: DataClient`（与 `v2/signals/`、`v2/backtesting/` 保持一致的解耦方式），任何满足 `DataClient` 协议的对象都可以传入，不再要求必须是 `FDClient`。
 
 ### 1.4 输入/输出
 
 **输入**：
 - 股票代码列表（`tickers`）
-- `FDClient` 实例（v2 数据层 API 客户端）
+- `DataClient` 实例（`FDClient`、`CachedDataClient`，或任何满足该协议的自定义数据源）
 - 可选参数：财报条数限制、市场基准代码、Bootstrap 次数、随机种子、EPS 惊喜过滤
 
 **输出**：
@@ -137,7 +139,7 @@ compute_car()                    # engine.py 公共 API
 ```python
 def compute_car(
     tickers: list[str],
-    fd_client: FDClient,
+    data_client: DataClient,
     *,
     earnings_limit: int = 12,
     market_ticker: str = "SPY",
@@ -152,7 +154,7 @@ def compute_car(
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `tickers` | `list[str]` | 必填 | 待分析的股票代码列表 |
-| `fd_client` | `FDClient` | 必填 | v2 数据层 API 客户端实例 |
+| `data_client` | `DataClient` | 必填 | 数据提供者（生产环境用 `FDClient`；协议类型，任何满足接口的对象均可） |
 | `earnings_limit` | `int` | `12` | 每个 ticker 最多处理的财报记录数 |
 | `market_ticker` | `str` | `"SPY"` | 市场基准代码，用于获取基准收益序列 |
 | `n_bootstrap` | `int` | `10_000` | Bootstrap 重采样次数 |
@@ -160,7 +162,7 @@ def compute_car(
 | `require_eps_surprise` | `bool` | `False` | 若为 `True`，过滤掉无 EPS 惊喜标签的事件 |
 
 **执行流程**：
-1. 调用 `fd_client` 获取 `market_ticker`（默认 SPY）完整收盘价序列
+1. 调用 `data_client` 获取 `market_ticker`（默认 SPY）完整收盘价序列
 2. 遍历每个 ticker，调用 `_compute_ticker_events()`；若异常则记录到 `skipped_tickers`
 3. 若设置 `require_eps_surprise=True`，过滤 `eps_surprise` 为 `None` 的事件
 4. 调用 `_aggregate()` 按 `source_type` 横截面聚合
@@ -173,7 +175,7 @@ def compute_car(
 ```python
 def _compute_ticker_events(
     ticker: str,
-    fd_client: FDClient,
+    data_client: DataClient,
     spy_closes: dict[str, float],  # 日期字符串 → 收盘价映射（YYYY-MM-DD）
     *,
     earnings_limit: int = 12,
@@ -181,9 +183,9 @@ def _compute_ticker_events(
 ```
 
 **执行流程**：
-1. 通过 `fd_client` 获取该 ticker 的财报历史记录（最多 `earnings_limit` 条）
+1. 通过 `data_client` 获取该 ticker 的财报历史记录（最多 `earnings_limit` 条）
 2. 调用 `_filter_retrospective()` 过滤追溯性披露（`filing_date - report_period >= 45` 自然日）
-3. 通过 `fd_client` 获取该 ticker 的历史收盘价
+3. 通过 `data_client` 获取该 ticker 的历史收盘价
 4. 计算个股日收益率序列与对应的 SPY 日收益率序列（时间对齐）
 5. 构建 `return_days`（有序交易日列表）和 `day_to_idx`（日期→索引映射）
 6. 对每条过滤后的财报记录调用 `_process_event()`，收集非 `None` 结果
@@ -659,7 +661,8 @@ poetry run python -m v2.event_study
 
 | 模块 | 用途 |
 |------|------|
-| `v2.data.FDClient` | Financial Datasets API 客户端，获取价格与财报历史数据 |
+| `v2.data.protocol.DataClient` | `compute_car()` 的数据源参数类型（协议，非具体实现） |
+| `v2.data.FDClient` | 生产环境常用的具体 `DataClient` 实现，获取价格与财报历史数据 |
 
 ### 10.2 外部库依赖
 

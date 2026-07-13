@@ -6,28 +6,32 @@
 
 ## 1. 模块概述
 
-v2 数据层为 Financial Datasets API 提供类型安全的 HTTP 客户端，是 v2 流水线的数据获取基础。该层由四个文件组成：
+v2 数据层为 Financial Datasets API 提供类型安全的 HTTP 客户端，是 v2 流水线的数据获取基础。该层由五个文件组成：
 
 | 文件 | 职责 |
 |------|------|
-| `client.py` | `FDClient` 类——封装 HTTP 通信、重试逻辑和数据反序列化 |
+| `client.py` | `FDClient` 类——封装 HTTP 通信、重试逻辑和数据反序列化；`FDClientError` 异常 |
+| `cached.py` | `CachedDataClient` 类——包装任意 `DataClient`，将响应磁盘缓存到 `.v2_cache/data/` |
 | `models.py` | 所有 API 响应的 Pydantic 数据模型 |
 | `protocol.py` | `DataClient` 协议——定义数据提供者的抽象接口 |
-| `__init__.py` | 公开导出所有模型类、`FDClient` 和 `DataClient` |
+| `__init__.py` | 公开导出所有模型类、`FDClient`、`FDClientError`、`CachedDataClient` 和 `DataClient` |
 
 **设计原则**:
 
-- **无状态客户端**: 不含内存缓存，每次调用直接请求 API，由调用方决定是否缓存
-- **不抛异常**: 所有方法在失败时返回空列表或 `None`，从不引发异常
+- **无状态客户端**: `FDClient` 本身不含内存缓存，每次调用直接请求 API；需要缓存时用 `CachedDataClient` 包装
+- **Fail Loud（失败必须显式抛出）**: 基础设施故障（网络异常、限速重试耗尽、HTTP 4xx/5xx）一律抛出 `FDClientError`；只有 HTTP 404（数据确实不存在）才返回 `None`。这是刻意的设计决策——若客户端在真实故障时静默返回空值，回测会把"取数失败"误判为"无信号"
+- **按申报日期做时点过滤（Point-in-Time）**: `get_financial_metrics` 按 `filing_date_lte` 而非 `report_period_lte` 过滤，确保只返回截至 `end_date` 已**公开可得**的数据，不泄漏未来信息
 - **类型安全**: 所有响应均通过 Pydantic 模型解析，字段类型明确
 - **向前兼容**: 所有模型使用 `extra="ignore"`，API 新增字段不会导致解析失败
-- **结构化子类型**: `DataClient` 是 `@runtime_checkable` 协议，任何实现了相应方法的类（无需继承）均可作为数据提供者使用
+- **结构化子类型**: `DataClient` 是 `@runtime_checkable` 协议，任何实现了相应方法的类（无需继承）均可作为数据提供者使用，`FDClient`、`CachedDataClient` 均满足该协议
 
 **公开导出** (`__init__.py`):
 
 ```python
 from v2.data import (
     FDClient,
+    FDClientError,
+    CachedDataClient,
     DataClient,
     Price,
     FinancialMetrics,
@@ -101,7 +105,9 @@ with FDClient() as fd:
 
 #### `get_financial_metrics(ticker, end_date, period="ttm", limit=10) -> list[FinancialMetrics]`
 
-获取截至 `end_date` 的财务指标，对应 API 端点 `/financial-metrics/`，按 `report_period_lte` 过滤。
+获取截至 `end_date` **已公开**的财务指标，对应 API 端点 `/financial-metrics/`，按 `filing_date_lte` 过滤（而非 `report_period_lte`）。
+
+**时点正确性（Point-in-Time）**：过滤依据是 SEC 申报被接受的日期（`filing_date`，美东时间），而非财报所属的财政期间结束日（`report_period`）。后者通常比前者早 3-6 周才对外公开，若按 `report_period_lte` 过滤会把"尚未公开的未来数据"泄漏进回测。服务端会排除没有 `filing_date` 的行，确保返回结果中的每一条都是 `end_date` 当天确实可知的。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -175,30 +181,38 @@ with FDClient() as fd:
 
 ## 3. 速率限制与错误处理
 
-### 3.1 `_request` 方法行为
+### 3.1 `_request` 方法行为（Fail-Loud 契约）
 
-所有 HTTP 请求均通过内部 `_request` 方法发出，该方法实现了统一的重试与错误处理策略：
+所有 HTTP 请求均通过内部 `_request` 方法发出。**该方法遵循"失败必须显式抛出"（fail-loud）契约**：只有"数据确实不存在"（HTTP 404）才返回 `None`；任何基础设施层面的故障都会抛出 `FDClientError`，绝不静默吞掉。
 
 | 场景 | 行为 |
 |------|------|
 | HTTP 429（被限速），且重试次数未耗尽 | 按预设延迟等待后重试 |
-| HTTP 429，3 次重试全部耗尽 | 记录 warning 日志，返回 `None` |
-| HTTP 4xx / 5xx（非 429） | 立即记录 warning 日志，返回 `None`，不重试 |
-| 网络异常（`requests.RequestException`） | 立即记录 warning 日志，返回 `None`，不重试 |
+| HTTP 429，3 次重试全部耗尽 | 抛出 `FDClientError(status_code=429)` |
+| HTTP 404 | 返回 `None`（数据确实不存在，是数据事实，不是故障） |
+| HTTP 4xx / 5xx（非 429、非 404） | 立即抛出 `FDClientError(status_code=...)`，不重试 |
+| 网络异常（`requests.RequestException`） | 立即抛出 `FDClientError`（`from exc` 保留原始异常链），不重试 |
 | 成功（2xx） | 返回 `requests.Response` 对象 |
 
 **重试延迟序列**: `(5s, 15s, 30s)`，最多重试 3 次。
 
-**重要**: `_request` 方法永不抛出异常，所有公开方法在底层返回 `None` 时均返回空列表或 `None`。
+**`FDClientError`**（定义于 `client.py`）：
+
+```python
+class FDClientError(Exception):
+    def __init__(self, message: str, *, status_code: int | None = None, path: str | None = None): ...
+```
+
+表示一次 API 请求因基础设施原因失败（鉴权、限速、服务端错误、网络故障），区别于"数据确实不存在"。**回测遇到此异常必须崩溃，而不是当作"无数据"处理**——这是刻意的设计决策：v1 客户端及本文档描述的旧版 v2 客户端曾经在网络异常和非 429 的 HTTP 错误上静默记录 warning 并返回 `None`/空列表，这会让"取数失败"和"无信号"在下游变得不可区分，从而悄悄污染回测结果。当前实现已改为在这些场景下直接抛出 `FDClientError`。
+
+各公开方法（`get_prices`、`get_news`、`get_insider_trades`、`get_earnings_history`）在遇到 404（即 `_request` 返回 `None`）时返回空列表；`get_company_facts`、`get_earnings`、`get_market_cap` 返回 `None`。除此之外的失败均以 `FDClientError` 向上传播，调用方需自行 `try/except FDClientError` 处理。
 
 ### 3.2 日志记录
 
 客户端使用 Python 标准 `logging` 模块（logger 名称为 `v2.data.client`）：
 
 - 429 重试：`INFO` 级别，记录延迟时间和重试次数
-- 重试耗尽：`WARNING` 级别
-- HTTP 错误（非 429）：`WARNING` 级别，记录状态码
-- 网络异常：`WARNING` 级别，记录异常信息
+- 其余错误路径不再记录 warning 日志后吞掉——改为直接抛出 `FDClientError`，由调用方决定如何记录/处理
 
 ---
 
@@ -233,6 +247,13 @@ with FDClient() as fd:
 | `report_period` | `str` | 报告期（如 `"2024-12-31"`） |
 | `period` | `str` | 期间类型（`"ttm"`、`"annual"`、`"quarterly"`） |
 | `currency` | `str \| None` | 货币代码 |
+
+**时点过滤元数据**（美东时间；无对应 SEC 申报日期的深度历史行为 `None`）:
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `filing_date` | `str \| None` | 该数据变为公开可得的申报日期，是 `get_financial_metrics` 时点过滤（`filing_date_lte`）依据的字段 |
+| `filing_datetime` | `str \| None` | 申报的完整时间戳（含时分秒） |
 
 **估值指标**:
 
@@ -500,9 +521,13 @@ class DataClient(Protocol):
     def get_insider_trades(self, ticker, end_date, start_date=None, limit=1000) -> list[InsiderTrade]: ...
     def get_company_facts(self, ticker) -> CompanyFacts | None: ...
     def get_earnings(self, ticker) -> Earnings | None: ...
+    def get_earnings_history(self, ticker, limit=12) -> list[EarningsRecord]: ...
+    def get_market_cap(self, ticker, end_date) -> float | None: ...
 ```
 
-**无需继承**：任何实现了上述方法的类，无论是否继承自 `DataClient`，均可通过 `isinstance(obj, DataClient)` 检查，并在流水线中作为数据提供者使用。
+**协议契约**（docstring 摘要）：空列表 / `None` 意味着数据确实不存在；基础设施故障（鉴权、限速、网络、服务端错误）必须抛出异常——静默返回空值会让"取数失败"在下游被误判为"无信号"，从而污染回测。`get_financial_metrics` 必须按时点过滤：只返回截至 `end_date` 已公开申报（`filing_date`）的数据，而不是财政期间已结束（`report_period`）但尚未公开的数据。
+
+**无需继承**：任何实现了上述方法的类，无论是否继承自 `DataClient`，均可通过 `isinstance(obj, DataClient)` 检查，并在流水线中作为数据提供者使用。`FDClient` 和 `CachedDataClient` 均满足该协议。
 
 **示例**（自定义数据提供者）:
 
@@ -518,6 +543,34 @@ assert isinstance(client, DataClient)  # True（结构化子类型）
 
 ---
 
+## 5A. `CachedDataClient`（磁盘缓存包装器，`cached.py`）
+
+`CachedDataClient` 包装任意 `DataClient` 实现，把响应以 JSON 文件形式缓存到磁盘（默认 `.v2_cache/data/`，已加入 `.gitignore`）。同一个 `(方法, 参数)` 组合的请求只会真正打到 API 一次；预热后的重跑是瞬时、免费、且不依赖网络的。
+
+```python
+from v2.data import CachedDataClient, FDClient
+
+fd = CachedDataClient(FDClient())
+prices = fd.get_prices("AAPL", "2024-01-01", "2024-12-31")  # 真实 API 调用
+prices = fd.get_prices("AAPL", "2024-01-01", "2024-12-31")  # 命中磁盘缓存，~0ms
+```
+
+**构造函数**：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `client` | `DataClient` | — | 被包装的底层客户端（通常是 `FDClient()`） |
+| `cache_dir` | `Path \| str` | `.v2_cache/data` | 缓存文件存放目录 |
+| `refresh` | `bool` | `False` | 为 `True` 时忽略已有缓存条目，强制重新请求并覆盖写入 |
+
+**缓存键**：对每次调用的方法名 + 参数字典做规范化 JSON 序列化（`sort_keys=True`）后取 SHA-256 哈希的前 24 位，作为文件名 `{key}.json`。
+
+**失败语义（继承自底层客户端）**：只有成功的响应会被缓存；底层客户端抛出的异常（如 `FDClientError`）会原样向上传播，不会被吞掉或缓存为"空结果"，保持 fail-loud 契约。
+
+**实现的 `DataClient` 全部方法**：`get_prices`、`get_financial_metrics`、`get_news`、`get_insider_trades`、`get_earnings_history`、`get_company_facts`、`get_earnings`、`get_market_cap`——按返回类型分三类内部辅助方法处理序列化：`_cached_list`（返回 `list[Model]`）、`_cached_item`（返回单个 `Model | None`）、`_cached_scalar`（返回 `float | None` 等原始类型）。
+
+---
+
 ## 6. 与 v1 数据层的区别
 
 v1 数据层位于 `src/tools/api.py`，以独立函数形式提供，不封装为类。
@@ -528,8 +581,8 @@ v1 数据层位于 `src/tools/api.py`，以独立函数形式提供，不封装�
 | **HTTP 连接** | 每次调用单独创建 `requests.get/post` | `requests.Session` 持久连接，性能更优 |
 | **认证头** | 每次请求手动传入 `headers` 字典 | 初始化时写入 Session 级别 `X-API-Key` |
 | **重试延迟** | `60s → 90s → 120s`（线性递增） | `5s → 15s → 30s`（3 次，更短） |
-| **重试后行为** | 返回最终响应对象（可能含错误） | 返回 `None`，永不抛出异常 |
-| **内存缓存** | 有（`src/data/cache.py` in-memory cache） | 无（无状态客户端） |
+| **重试后行为** | 返回最终响应对象（可能含错误） | 抛出 `FDClientError`（fail-loud，仅 404 返回 `None`） |
+| **缓存** | 内存缓存（`src/data/cache.py`），进程结束即失效 | 无内置缓存；可选 `CachedDataClient` 磁盘缓存包装器，持久化到 `.v2_cache/data/` |
 | **盈利数据** | 无 `get_earnings` / `get_earnings_history` | 提供 `get_earnings()` 和 `get_earnings_history()` |
 | **公司数据** | 有 `get_company_facts`（通过 `CompanyFactsResponse`） | 有 `get_company_facts`（通过 `CompanyFacts` 直接模型） |
 | **LineItem 支持** | 有 `search_line_items`（POST 请求） | 无（v2 不提供此接口） |
