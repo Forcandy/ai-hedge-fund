@@ -483,6 +483,8 @@ poetry run pytest -k "test_name"                       # 按名称运行测试
 - [backtest_system.md](backtest_system.md) — src/ 回测系统详细说明
 
 ### v2 模块文档
+- [../ROADMAP.md](../ROADMAP.md) — v2 路线图（能力地图、开放贡献项、当前重点）
+- [../VISION.md](../VISION.md) — v2 愿景（fund 作为持久化对象、三种模式共用的 `run_cycle` 流水线）
 - [v2_data_layer.md](v2_data_layer.md) — v2 数据层（FDClient、FDClientError、CachedDataClient、Pydantic 模型、时点过滤）
 - [v2_signals_system.md](v2_signals_system.md) — v2 Alpha 模型与 LLM 投资人系统（AlphaModel、LLMAgent、BuffettAgent、PEADModel、v2/llm/、FundamentalsSnapshot）
 - [v2_event_study_system.md](v2_event_study_system.md) — v2 事件研究框架（compute_car、市场模型、统计检验、可视化）

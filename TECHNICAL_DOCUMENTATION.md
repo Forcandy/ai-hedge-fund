@@ -284,6 +284,8 @@ ai-hedge-fund/
 │   └── docker-compose.yml
 ├── pyproject.toml                # Python项目配置
 ├── .env.example                  # 环境变量示例
+├── ROADMAP.md                     # v2 路线图（能力地图与开放贡献项）
+├── VISION.md                      # v2 愿景（fund 作为持久化对象、run_cycle 流水线）
 └── README.md                     # 项目说明
 ```
 
