@@ -1,7 +1,7 @@
 # AI对冲基金系统 - 技术文档
 
-> 版本: 2026.7.10
-> 生成日期: 2026-07-13
+> 版本: 2.0.0
+> 生成日期: 2026-07-22
 > 项目: AI Hedge Fund - 教育性质的AI驱动对冲基金系统
 
 ---
@@ -175,9 +175,17 @@
 
 ### 1.6 版本历史
 
-- **v2026.7.10** (当前版本)
+- **v2.0.0** (当前版本，项目版本号从日历式改为语义化版本)
+  - v2/ 新增 Fund 体系：`fund/spec.py`（`FundSpec`/`StrategySpec`/`BlendPolicy` mandate 数据 + `Fund` 活体实例）、`brokers/`（`Broker` 协议 + `SimBroker`）、`portfolio/construction.py`（`blend_signals()` 信念加权组合构建）、`risk/limits.py`（`apply_limits()` 硬限额裁剪）、`pipeline/`（`run_cycle()` 一次完整交易周期 + `CycleRecord`）
+  - v2/signals/ 新增 4 位 LLM 投资人人格：`MungerAgent`、`GrahamAgent`、`LynchAgent`、`DruckenmillerAgent`（`ALPHA_MODEL_REGISTRY` 从 2 个模型扩展到 6 个）
+  - v2/ 新增策略库 `strategies/*.yaml`（fundamental-ls、deep-value、inflections、earnings-drift）与示例基金 `funds/example.yaml`
+  - 删除 `v2/analyze.py`（单模型单股票 CLI），改为统一入口 `v2/run.py`（`poetry run python -m v2.run`）：无参数进入交互式建基金向导，传 mandate YAML 则非交互跑一次周期
+  - `FundamentalsSnapshot.content_hash`/`render()` 改为排除 `as_of` 日期，让同一份基本面数据在不同日期间命中同一条 LLM 缓存
+  - 新依赖 `pyyaml`（mandate YAML 解析）
+
+- **v2026.7.10**
   - v2/ 模块新增 `signals/`（`AlphaModel`/`QuantModel`/`LLMAgent` 接口，`BuffettAgent`、`PEADModel` 实现）与 `llm/`（`LLMClient` 协议、`AnthropicLLM`、`PromptCache`）
-  - v2/ 新增 `features/snapshot.py`（`FundamentalsSnapshot` 时点正确基本面快照）、`data/cached.py`（`CachedDataClient` 磁盘缓存）、`demo/`（PEAD 回测演示仪表盘）、`analyze.py`（分析师时点观点 CLI）
+  - v2/ 新增 `features/snapshot.py`（`FundamentalsSnapshot` 时点正确基本面快照）、`data/cached.py`（`CachedDataClient` 磁盘缓存）、`demo/`（PEAD 回测演示仪表盘）、`analyze.py`（分析师时点观点 CLI，v2.0.0 中已删除）
   - v2 数据层改为 fail-loud 契约：基础设施故障抛出 `FDClientError`，不再静默返回空值；`get_financial_metrics` 改按 `filing_date_lte` 时点过滤
   - v2 回测引擎删除旧的 `Strategy`/`PEADStrategy`/`TradeSignal` 架构，改为 `BacktestEngine.run_alpha()` 直接驱动 `AlphaModel`
   - 新增 `ROADMAP.md`、`VISION.md`（v2 路线图与愿景文档）
@@ -264,18 +272,22 @@ ai-hedge-fund/
 │   │   └── database/             # 数据库配置
 │   └── frontend/                 # React前端
 │       └── src/
-├── v2/                            # 对冲基金核心引擎重建（与src/并行开发，尚未接入app/）
+├── v2/                            # 对冲基金核心引擎重建（v2.0.0，与src/并行开发，尚未接入app/）
 │   ├── data/                      # 数据层：FDClient（fail-loud）、CachedDataClient、DataClient协议
-│   ├── signals/                   # AlphaModel接口 + 量化/LLM分析师（QuantModel、LLMAgent、BuffettAgent、PEADModel）
+│   ├── signals/                   # AlphaModel接口 + 6个量化/LLM分析师（Buffett、Munger、Graham、Lynch、Druckenmiller、PEAD）
 │   ├── llm/                       # LLM提供商层：LLMClient协议、AnthropicLLM、PromptCache
 │   ├── features/                  # 特征工程：FundamentalsSnapshot（时点正确基本面快照）
+│   ├── fund/                      # FundSpec/StrategySpec/BlendPolicy（mandate数据）+ Fund（活体实例）
+│   ├── brokers/                   # Broker协议 + SimBroker（回测用确定性模拟经纪商）
+│   ├── portfolio/                 # 组合构建：blend_signals()（信念加权，可选市场中性）
+│   ├── risk/                      # 风控硬限额：apply_limits()（单票上限 + 总敞口上限）
+│   ├── pipeline/                  # run_cycle()：一次完整交易周期的唯一代码路径 + CycleRecord
+│   ├── strategies/                # 策略库YAML（fundamental-ls、deep-value、inflections、earnings-drift）
+│   ├── funds/                     # 基金mandate YAML（example.yaml已跟踪，其余gitignore）
 │   ├── backtesting/                # 回测引擎：BacktestEngine.run_alpha()（Alpha模型无关）
 │   ├── event_study/                # 事件研究系统：compute_car()
 │   ├── demo/                       # 演示仪表盘（PEAD回测终端实时展示）
-│   ├── analyze.py                  # CLI：向任意分析师询问某只股票的时点观点
-│   ├── pipeline/                  # 数据/信号处理管道（规划中）
-│   ├── portfolio/                 # 组合构建与管理（规划中）
-│   ├── risk/                      # 风险模型（规划中）
+│   ├── run.py                      # 统一CLI：交互式建基金向导 + 非交互式跑一次周期
 │   ├── validation/                # 验证与测试工具（规划中）
 │   └── models.py                  # v2公共数据模型（Signal、QuantSignals等）
 ├── tests/                        # 测试代码

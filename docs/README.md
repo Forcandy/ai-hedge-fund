@@ -56,22 +56,43 @@ ai-hedge-fund/
 │       ├── cli.py                # 回测 CLI 参数解析
 │       ├── types.py              # 回测类型定义
 │       └── valuation.py          # 回测估值工具
-├── v2/                           # 对冲基金核心引擎重建（v2，与 v1 并行开发，尚未接入 app/）
+├── v2/                           # 对冲基金核心引擎重建（v2.0.0，与 v1 并行开发，尚未接入 app/）
 │   ├── data/
 │   │   ├── client.py             # FDClient（类型化 API 客户端，fail-loud，支持上下文管理器）
 │   │   ├── cached.py             # CachedDataClient（磁盘缓存包装器，.v2_cache/data/）
 │   │   ├── protocol.py           # DataClient 协议（结构化子类型，解耦具体数据源）
 │   │   └── models.py             # Pydantic 数据模型（含 EarningsRecord 等）
-│   ├── signals/                  # AlphaModel 接口 + 量化/LLM 分析师实现
+│   ├── signals/                  # AlphaModel 接口 + 量化/LLM 分析师实现（6 个模型）
 │   │   ├── base.py               # AlphaModel（ABC）、QuantModel
 │   │   ├── llm_agent.py          # LLMAgent（LLM 投资人 Agent 公共基类）
 │   │   ├── buffett.py            # BuffettAgent（Warren Buffett 人格）
+│   │   ├── munger.py             # MungerAgent（Charlie Munger 人格）
+│   │   ├── graham.py             # GrahamAgent（Benjamin Graham 人格）
+│   │   ├── lynch.py              # LynchAgent（Peter Lynch 人格）
+│   │   ├── druckenmiller.py      # DruckenmillerAgent（Stanley Druckenmiller 人格）
 │   │   └── pead.py               # PEADModel（盈余公告后漂移量化模型）
 │   ├── llm/                      # LLM 提供商层（镜像 data/protocol.py 的解耦方式）
 │   │   ├── client.py             # LLMClient 协议 + AnthropicLLM 实现
 │   │   └── cache.py              # PromptCache（LLM 决策磁盘缓存，.v2_cache/llm/）
 │   ├── features/
 │   │   └── snapshot.py           # FundamentalsSnapshot（LLM Agent 的时点正确输入）
+│   ├── fund/
+│   │   └── spec.py               # FundSpec/StrategySpec/BlendPolicy（mandate 数据）+ Fund（活体实例）
+│   ├── brokers/                  # Broker 协议（镜像 data/protocol.py）
+│   │   ├── protocol.py           # Broker 协议
+│   │   ├── sim.py                # SimBroker（回测用确定性模拟经纪商）
+│   │   └── models.py             # Position, Order, Fill
+│   ├── portfolio/
+│   │   └── construction.py       # blend_signals()：Signal 混合为目标权重
+│   ├── risk/
+│   │   └── limits.py             # apply_limits()：硬限额裁剪（单票上限 + 总敞口上限）
+│   ├── pipeline/
+│   │   ├── run_cycle.py          # run_cycle()：一次完整周期的唯一代码路径
+│   │   ├── execution.py          # build_orders()：目标权重 -> 订单
+│   │   └── models.py             # CycleRecord, StrategyRecord, TickerSkip
+│   ├── strategies/                # 策略库 YAML（fundamental-ls, deep-value, inflections, earnings-drift）
+│   ├── funds/
+│   │   └── example.yaml          # 示例基金 mandate（其余用户基金已 gitignore）
 │   ├── event_study/
 │   │   ├── engine.py             # compute_car() 事件研究主入口
 │   │   ├── models.py             # EventCAR, EventStudyResult 等 Pydantic 模型
@@ -82,7 +103,7 @@ ai-hedge-fund/
 │   │   └── models.py             # Trade, PerformanceMetrics, BacktestResult
 │   ├── demo/
 │   │   └── backtest.py           # PEAD 回测演示仪表盘（终端实时展示）
-│   ├── analyze.py                # CLI：向任意分析师询问某只股票的时点观点
+│   ├── run.py                     # 统一 CLI：交互式建基金向导 + 非交互式跑一次周期
 │   └── models.py                 # Signal, QuantSignals 等顶层 Pydantic 模型
 ├── app/
 │   ├── backend/                  # FastAPI 后端
@@ -395,12 +416,14 @@ poetry run python src/main.py --ticker AAPL --show-reasoning
 poetry run python src/backtester.py --ticker AAPL,MSFT,NVDA
 ```
 
-### v2 CLI（独立于 src/，见 [v2_signals_system.md](v2_signals_system.md)）
+### v2 CLI（独立于 src/，见 [v2_fund_system.md](v2_fund_system.md)、[v2_signals_system.md](v2_signals_system.md)）
 
 ```bash
-# 向某位分析师询问某只股票的时点观点
-poetry run python -m v2.analyze NVDA
-poetry run python -m v2.analyze NVDA --date 2024-06-01 --agent pead
+# THE command：交互式建基金向导——选股票、选策略、设资金，跑第一次周期
+poetry run python -m v2.run
+
+# 或给一份 mandate YAML：非交互式跑一次周期，完整 CycleRecord 打印到 stdout
+poetry run python -m v2.run v2/funds/example.yaml --date 2025-06-03
 
 # PEAD 回测演示仪表盘（终端实时展示，预热缓存后可离线运行）
 poetry run python -m v2.demo.backtest
@@ -486,7 +509,8 @@ poetry run pytest -k "test_name"                       # 按名称运行测试
 - [../ROADMAP.md](../ROADMAP.md) — v2 路线图（能力地图、开放贡献项、当前重点）
 - [../VISION.md](../VISION.md) — v2 愿景（fund 作为持久化对象、三种模式共用的 `run_cycle` 流水线）
 - [v2_data_layer.md](v2_data_layer.md) — v2 数据层（FDClient、FDClientError、CachedDataClient、Pydantic 模型、时点过滤）
-- [v2_signals_system.md](v2_signals_system.md) — v2 Alpha 模型与 LLM 投资人系统（AlphaModel、LLMAgent、BuffettAgent、PEADModel、v2/llm/、FundamentalsSnapshot）
+- [v2_signals_system.md](v2_signals_system.md) — v2 Alpha 模型与 LLM 投资人系统（AlphaModel、LLMAgent、5 位投资人人格、PEADModel、v2/llm/、FundamentalsSnapshot）
+- [v2_fund_system.md](v2_fund_system.md) — v2 Fund 系统（FundSpec/Fund、Broker/SimBroker、组合构建、风控硬限额、run_cycle 流水线、`v2.run` 统一 CLI、策略库）
 - [v2_event_study_system.md](v2_event_study_system.md) — v2 事件研究框架（compute_car、市场模型、统计检验、可视化）
 - [v2_backtesting_system.md](v2_backtesting_system.md) — v2 回测引擎（BacktestEngine.run_alpha、绩效指标）
 

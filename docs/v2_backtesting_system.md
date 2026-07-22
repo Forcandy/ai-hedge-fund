@@ -11,6 +11,8 @@
 v2 回测系统是一个**Alpha 模型无关（Alpha-Model-Agnostic）**的交易模拟引擎。引擎直接驱动任意 `AlphaModel`（定义于 `v2/signals/base.py`，量化模型与 LLM 投资人 Agent 的共同接口）在历史交易日网格上逐日形成观点（`Signal`），并接管一切后续工作——价格查询、入场时机判断、仓位大小计算、盈亏结算、权益曲线构建与绩效指标计算。
 
 > **架构变更提示**：早期版本的 v2 回测系统曾采用 `Strategy` 抽象基类 + `PEADStrategy` + `TradeSignal` 的"批量生成信号 → 引擎执行"两阶段架构（`v2/backtesting/strategy.py`）。该文件已被删除，取而代之的是与 `v2/signals/` 模块共享的 `AlphaModel` 接口——量化模型（`QuantModel`，如 `PEADModel`）与 LLM 投资人 Agent（`LLMAgent`，如 `BuffettAgent`）现在使用同一套接口、同一个回测引擎，无需再为每种模型单独适配"生成信号"逻辑。
+>
+> **v2.0.0 补充**：本文档的 `BacktestEngine.run_alpha()` 与 [`v2_fund_system.md`](./v2_fund_system.md) 中新引入的 `run_cycle()` 是两条**并存但尚未统一**的执行路径——`run_alpha()` 针对单个 `AlphaModel` 在一批股票上做多空回测，`run_cycle()` 是"整支基金（多策略、混合、风控、执行）一次完整周期"的流水线。`ROADMAP.md` 明确把两者的收敛列为下一步（"backtest/paper convergence next"），本文档描述的仍是当前独立可用的回测引擎，尚未被 `run_cycle` 取代。
 
 ### 1.2 设计目标
 

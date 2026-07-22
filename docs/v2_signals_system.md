@@ -1,6 +1,6 @@
 # v2 Alpha 模型与 LLM 投资人系统 (v2 Signals & LLM System)
 
-源目录: `v2/signals/`、`v2/llm/`、`v2/features/`、`v2/demo/`、`v2/analyze.py`
+源目录: `v2/signals/`、`v2/llm/`、`v2/features/`、`v2/demo/`
 
 ---
 
@@ -9,22 +9,27 @@
 v2 的核心抽象是 **Alpha 模型（`AlphaModel`）**：任何对某只股票形成观点、返回 `Signal`（`[-1, +1]` 区间的信念值 + 文字理由）的组件。两种风格共享同一接口：
 
 - **量化模型（`QuantModel`）**：纯数学/数据驱动，如盈余公告后漂移（PEAD）
-- **LLM 投资人 Agent（`LLMAgent`）**：以某位知名投资人的口吻，对逐笔时点正确的基本面快照进行推理，如 Warren Buffett Agent
+- **LLM 投资人 Agent（`LLMAgent`）**：以某位知名投资人的口吻，对逐笔时点正确的基本面快照进行推理，目前有 5 位：Warren Buffett、Charlie Munger、Benjamin Graham、Peter Lynch、Stanley Druckenmiller
 
-两者都能不加区分地接入同一个回测引擎（`BacktestEngine.run_alpha`，见 [`v2_backtesting_system.md`](./v2_backtesting_system.md)），也是未来实盘/纸面交易 `run_cycle` 流水线的统一分析师接口。
+两者都能不加区分地接入同一个回测引擎（`BacktestEngine.run_alpha`，见 [`v2_backtesting_system.md`](./v2_backtesting_system.md)），也是 `run_cycle` 流水线（见 [`v2_fund_system.md`](./v2_fund_system.md)）的统一分析师接口——一个模型只需实现一次 `predict()`，就能同时用于单独回测、被某个策略（"pod"）征召、或在实盘/纸面交易中运行。
+
+> **v2.0.0 变更提示**：早期版本的单股票 CLI `v2/analyze.py` 已被删除，其"向某位分析师询问一只股票的时点观点"能力被更完整的 `poetry run python -m v2.run`（交互式建基金 + 跑 `run_cycle`）取代，详见 [`v2_fund_system.md`](./v2_fund_system.md)。
 
 | 目录/文件 | 职责 |
 |-----------|------|
 | `v2/signals/base.py` | `AlphaModel`（抽象基类）+ `QuantModel`（量化模型公共数值工具） |
 | `v2/signals/llm_agent.py` | `LLMAgent`（LLM 投资人 Agent 公共基类，承载全部机械逻辑） |
-| `v2/signals/buffett.py` | `BuffettAgent`——第一个 LLM 投资人人格实现 |
+| `v2/signals/buffett.py` | `BuffettAgent`——Warren Buffett 人格 |
+| `v2/signals/munger.py` | `MungerAgent`——Charlie Munger 人格 |
+| `v2/signals/graham.py` | `GrahamAgent`——Benjamin Graham 人格 |
+| `v2/signals/lynch.py` | `LynchAgent`——Peter Lynch 人格 |
+| `v2/signals/druckenmiller.py` | `DruckenmillerAgent`——Stanley Druckenmiller 人格 |
 | `v2/signals/pead.py` | `PEADModel`——盈余公告后漂移量化模型 |
-| `v2/signals/__init__.py` | 公开导出 + `ALPHA_MODEL_REGISTRY` |
+| `v2/signals/__init__.py` | 公开导出 + `ALPHA_MODEL_REGISTRY`（6 个模型） |
 | `v2/llm/client.py` | `LLMClient` 协议 + `AnthropicLLM` 实现 + `extract_json` |
 | `v2/llm/cache.py` | `PromptCache`——按 prompt 内容哈希缓存 LLM 决策到磁盘 |
 | `v2/features/snapshot.py` | `FundamentalsSnapshot`——LLM Agent 的共享时点正确输入 |
 | `v2/demo/backtest.py` | PEAD 回测演示仪表盘（终端实时展示） |
-| `v2/analyze.py` | CLI：向任意分析师询问某只股票的时点观点 |
 
 ---
 
@@ -136,25 +141,51 @@ key    = prompt_key(name, model, system, user)        # 缓存键
 
 ---
 
-## 4. `BuffettAgent`（`v2/signals/buffett.py`）
+## 4. LLM 投资人人格（`v2/signals/{buffett,munger,graham,lynch,druckenmiller}.py`）
 
-第一个 LLM 投资人分析师，对 Warren Buffett 公开投资哲学的风格化近似（`VISION.md` 明确说明：这些人格不是真人本人，也不构成对其的背书）。
+五个已实现的 LLM 投资人分析师，都是对应投资人公开投资哲学的风格化近似（`VISION.md` 明确说明：这些人格不是真人本人，也不构成对其的背书）。
 
-**该类只包含一个系统提示词**——全部机械逻辑都在 `LLMAgent` 基类中，数据全部来自共享的时点正确 `FundamentalsSnapshot`。
+**每个类只包含一个系统提示词**——全部机械逻辑都在 `LLMAgent` 基类中（见第 3 节），数据全部来自共享的时点正确 `FundamentalsSnapshot`（见第 5 节）。五个人格共享的硬性规则：只能从提供的数据推理，把快照中最新一期的申报日期当作"现在"，不得使用其之后发生的任何知识，不得捏造数字；响应必须是严格 JSON：`{"signal": "bullish"|"bearish"|"neutral", "confidence": <0-100>, "reasoning": "..."}`。
 
-系统提示词要点：
-1. 能力圈——数据是否足以理解这门生意
-2. 护城河——ROE 是否持续高企、利润率是否稳定或改善、是否有定价权
-3. 管理层质量——账面价值复利增长、杠杆是否合理、自由现金流是否稳定
-4. 财务实力——低负债、健康流动比率、稳定盈利
-5. 估值——价格相对质量与增长是否合理（"合理价格的好公司胜过便宜价格的普通公司"）
-6. 长期前景——是否愿意持有十年
+### 4.1 `BuffettAgent`——Warren Buffett（`buffett.py`）
+
+系统提示词要点：能力圈（数据是否足以理解这门生意）→ 护城河（ROE 是否持续高企、利润率是否稳定或改善、是否有定价权）→ 管理层质量（账面价值复利增长、杠杆是否合理、自由现金流是否稳定）→ 财务实力（低负债、健康流动比率、稳定盈利）→ 估值（"合理价格的好公司胜过便宜价格的普通公司"）→ 长期前景（是否愿意持有十年）。
 
 **信号规则**：bullish=优质且持续、价格合理或更好；bearish=业务疲软/恶化，或价格要求完美预期；neutral=证据混杂，或优质公司但价格明显过高。
 
 **置信度量表**：90-100 极强信念（证据充分）；70-89 稳固信念；40-69 混杂；10-39 弱/投机性。
 
-**硬性规则**：只能从提供的数据推理，不得使用 as-of 日期之后发生的任何知识，不得捏造数字；数据不足时明确说明并给出中性判断。响应必须是严格 JSON：`{"signal": ..., "confidence": ..., "reasoning": ...}`。
+### 4.2 `MungerAgent`——Charlie Munger（`munger.py`）
+
+强调"反过来想"（invert）：先想什么会让这笔投资失败，再看生意质量是否历年持续（不是某一年好）、账面价值是否真实复利增长、估值是否合理。判断不清时明确归入"太难判断"（too-hard pile）并给中性。语气刻意直白、不留余地。
+
+**信号规则**：bullish=毫无疑问的优质生意且价格不离谱；bearish=平庸/恶化的生意、可疑的数字，或估值需要相信蠢事才成立；neutral=太难判断，或优质生意但价格不愿意付。
+
+**置信度量表**：90-100 罕见的、质量与价格都对齐的明显案例；70-89 稳固；40-69 证据混杂；10-39 多半属于"太难判断"。
+
+### 4.3 `GrahamAgent`——Benjamin Graham（`graham.py`）
+
+价值投资之父，作为防御型投资者评估：安全边际优先（P/E、市净率相对保守标准是否够低）→ 财务实力（流动比率 > 1.5、低负债权益比）→ 盈利稳定性（历史记录中是否持续为正、无剧烈波动）→ 对"为成长溢价买单"高度警惕。
+
+**信号规则**：bullish=稳健生意、强健资产负债表、价格提供真实安全边际；bearish=财务薄弱、盈利不稳定，或价格透支了希望而非已证实的业绩（估值过高本身就是利空事实）；neutral=生意健全但安全边际不足。
+
+**置信度量表**：90-100 每条标准都有清晰的量化支撑；70-89 多数标准满足；40-69 混杂；10-39 投机性区域。
+
+### 4.4 `LynchAgent`——Peter Lynch（`lynch.py`）
+
+"了解你持有的东西"：先把公司归类（快速增长者/稳健增长者/缓慢增长者/困境反转），再做 PEG 测试（P/E 相对可见的盈利增长率是否有吸引力），检查故事是否成立（营收增长转化为盈利增长、利润率保持或改善），并避开高负债公司。倡导用大白话讲清楚投资逻辑，讲不清楚就中性。
+
+**信号规则**：bullish=真实可见的盈利增长，且 P/E 尚未提前计入（PEG 有吸引力）；bearish=增长放缓却享受高溢价倍数，或"故事很热但数字在变冷"；neutral=公司不错但已充分定价，或数据不足以判断类别。
+
+**置信度量表**：90-100 经典设置（增长便宜且可见）；70-89 故事好、价格公道；40-69 混杂；10-39 看不清持有的是什么。
+
+### 4.5 `DruckenmillerAgent`——Stanley Druckenmiller（`druckenmiller.py`）
+
+关注拐点而非静态水平：扫描最近几个季度相对更早时期，判断营收增长和利润率是在加速还是转弱，EPS 动能是否在积累；再问"市场已经price in了什么"，寻找拐点与价格错位的不对称机会；只有拐点和价格同时对齐才重仓，否则不出手。文档明确标注了**诚实的能力边界**：该人格目前只对基本面快照推理，尚无宏观、利率或价格走势数据，因此只能从基本面自身的变化趋势中寻找拐点。
+
+**信号规则**：bullish=近期季度出现明显加速、且价格尚未完全反映；bearish=明显恶化或转弱，尤其是价格仍按旧趋势定价时；neutral=看不出明显拐点，或趋势与价格已经完全一致。
+
+**置信度量表**：90-100 明确无误的拐点 + 不对称机会；70-89 稳固的趋势变化；40-69 混杂或为时尚早；10-39 无优势可言。
 
 ---
 
@@ -163,6 +194,8 @@ key    = prompt_key(name, model, system, user)        # 缓存键
 LLM 分析师的共享输入：一位投资人 Agent 在给定日期**被允许知道**的关于一家公司的全部信息——一段财务指标历史（每一行都可证明在 `as_of` 之前已公开，数据层按 `filing_date` 而非 `report_period` 过滤）+ 一些用 Python 预先算好的衍生聚合指标（让 LLM 基于事实推理，而不是重新做算术）。
 
 `content_hash` 是快照内容的稳定哈希，作为 LLM 调用的缓存键——只有当新的财报改变了快照内容，Agent 才会重新推理。
+
+**`content_hash` 与 `render()` 均刻意排除 `as_of` 字段**（`model_dump_json(exclude={"as_of"})`）：两个不同的日期，只要期间没有新的财报申报，看到的基本面数据完全相同，就应该命中同一个缓存键、生成完全相同的 prompt——而不是每换一个日期就重新触发一次真实的 LLM 调用。`.render()` 的文案也相应改为不出现具体日期（"Treat the most recent filing shown as the present"），既保证了同一份基本面数据无论在哪一天问都渲染成完全一致的文本，也避免 LLM 把提示词里的日历日期和该日期之后发生的真实世界事件联系起来。
 
 ### 5.1 `build_snapshot(ticker, as_of, data_client, periods=20) -> FundamentalsSnapshot`
 
@@ -294,40 +327,35 @@ PEADModel(*, earnings_limit: int = 8, signal_window_days: int = 4)
 
 ```python
 ALPHA_MODEL_REGISTRY: dict[str, type[AlphaModel]] = {
+    # Quant models
     "pead": PEADModel,
+    # LLM investor agents
     "buffett": BuffettAgent,
+    "munger": MungerAgent,
+    "graham": GrahamAgent,
+    "lynch": LynchAgent,
+    "druckenmiller": DruckenmillerAgent,
 }
 ```
 
-CLI（`v2/analyze.py`）和未来的分析师选择逻辑通过这个注册表按名字实例化模型，新增分析师只需在此登记一行即可接入 CLI 与回测。
+6 个模型（1 个量化 + 5 个 LLM 人格）。`v2/fund/spec.py` 的 `Fund`（见 [`v2_fund_system.md`](./v2_fund_system.md)）和 `v2/run.py` 的交互式建基金向导都通过这个注册表按名字实例化模型——新增分析师只需在此登记一行即可同时接入回测、策略库 YAML 与建基金 CLI。
 
 **公开导出**：
 
 ```python
 from v2.signals import (
     AlphaModel, QuantModel, LLMAgent,
-    BuffettAgent, PEADModel,
+    BuffettAgent, MungerAgent, GrahamAgent, LynchAgent, DruckenmillerAgent,
+    PEADModel,
     ALPHA_MODEL_REGISTRY,
 )
 ```
 
 ---
 
-## 9. `v2/analyze.py` — 单股票时点观点 CLI
+## 9. 单模型的时点观点 CLI 已并入 `v2.run`
 
-```bash
-poetry run python -m v2.analyze NVDA
-poetry run python -m v2.analyze NVDA --date 2024-06-01   # 以某个历史日期为准
-poetry run python -m v2.analyze AAPL --agent pead
-```
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `ticker`（位置参数） | — | 股票代码 |
-| `--date` | 今日 | as-of 日期；分析师只能看到这一天之前已公开申报的数据 |
-| `--agent` | `"buffett"` | 从 `ALPHA_MODEL_REGISTRY` 的 key 中选择 |
-
-内部使用 `CachedDataClient(FDClient())`（见 [`v2_data_layer.md`](./v2_data_layer.md#5a-cacheddataclient磁盘缓存包装器cachedpy)）——为 spinner 构建的快照会在 `predict()` 内部被免费复用一次，重复询问同一 `(ticker, date)` 也不再产生新请求。输出终端友好的方向（BULLISH/BEARISH/NEUTRAL）、置信度、模型名（含是否命中缓存）、耗时与理由文本。
+早期版本这里是独立的 `v2/analyze.py`（`poetry run python -m v2.analyze NVDA --agent buffett`）——该文件已在 v2.0.0 删除。同等能力（选一个模型、选一个 as-of 日期、看它对一只股票的时点观点）现在是 `poetry run python -m v2.run` 交互式建基金流程的一部分：建基金时选中的每个策略、每个模型都会对整个股票池跑一遍 `predict()`，并把每一条观点（方向、置信度、理由）展示在"AGENT ANALYSIS"表格里。完整的 CLI 说明见 [`v2_fund_system.md`](./v2_fund_system.md#7-v2runpy--统一-cli)。
 
 ---
 
@@ -365,17 +393,19 @@ poetry run python -m v2.demo.backtest --refresh    # 强制重新拉取数据，
 | `pandas` | RSI 等技术指标计算的价格序列输入 | `signals/base.py` |
 | `pydantic` | `Signal`、`FundamentalsSnapshot`、`PeriodFundamentals` 等模型 | `models.py`, `features/snapshot.py` |
 | `langchain-anthropic` | `AnthropicLLM` 的底层传输 | `llm/client.py` |
-| `rich` | CLI/demo 的终端富文本输出（spinner、表格、面板） | `analyze.py`, `demo/backtest.py` |
-| `dotenv`（`python-dotenv`） | 加载 `.env` | `analyze.py`, `demo/backtest.py` |
+| `rich` | demo 的终端富文本输出（spinner、表格、面板） | `demo/backtest.py` |
+| `dotenv`（`python-dotenv`） | 加载 `.env` | `demo/backtest.py` |
 
 ### 11.2 项目内部依赖
 
 | 模块 | 导入项 | 用途 |
 |------|--------|------|
 | `v2.data.protocol` | `DataClient` | Alpha 模型 `predict()` 的数据源协议参数 |
-| `v2.data` | `CachedDataClient`, `FDClient` | CLI/demo 的具体数据源 |
+| `v2.data` | `CachedDataClient`, `FDClient` | demo 的具体数据源 |
 | `v2.models` | `Signal` | Alpha 模型的统一输出类型 |
 | `v2.backtesting` | `BacktestEngine` | `demo/backtest.py` 驱动回测 |
+
+> 注：单模型 CLI 相关的 `rich`/`dotenv`/`CachedDataClient` 用法已随 `v2/analyze.py` 的删除转移到 `v2/run.py`（新增 `questionary`、`prompt_toolkit`、`pyyaml` 等依赖），见 [`v2_fund_system.md`](./v2_fund_system.md)。
 
 ### 11.3 标准库
 
