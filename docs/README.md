@@ -56,7 +56,7 @@ ai-hedge-fund/
 │       ├── cli.py                # 回测 CLI 参数解析
 │       ├── types.py              # 回测类型定义
 │       └── valuation.py          # 回测估值工具
-├── v2/                           # 对冲基金核心引擎重建（v2.0.0，与 v1 并行开发，尚未接入 app/）
+├── v2/                           # 对冲基金核心引擎重建（v2.0.1，与 v1 并行开发，尚未接入 app/）
 │   ├── data/
 │   │   ├── client.py             # FDClient（类型化 API 客户端，fail-loud，支持上下文管理器）
 │   │   ├── cached.py             # CachedDataClient（磁盘缓存包装器，.v2_cache/data/）
@@ -99,11 +99,10 @@ ai-hedge-fund/
 │   │   ├── stats.py              # fit_market_model, bootstrap_ci 等统计函数
 │   │   └── plot.py               # CAR 可视化图表（matplotlib）
 │   ├── backtesting/
-│   │   ├── engine.py             # BacktestEngine.run_alpha()（Alpha 模型无关回测引擎）
+│   │   ├── engine.py             # BacktestEngine.run_alpha()（单模型回测，旧版专用工具）
+│   │   ├── fund.py               # backtest_fund()：run_cycle 循环整段历史（整支基金回测）
 │   │   └── models.py             # Trade, PerformanceMetrics, BacktestResult
-│   ├── demo/
-│   │   └── backtest.py           # PEAD 回测演示仪表盘（终端实时展示）
-│   ├── run.py                     # 统一 CLI：交互式建基金向导 + 非交互式跑一次周期
+│   ├── run.py                     # 统一 CLI：交互式建基金向导 + 跑一次周期 / 回测整支基金
 │   └── models.py                 # Signal, QuantSignals 等顶层 Pydantic 模型
 ├── app/
 │   ├── backend/                  # FastAPI 后端
@@ -419,16 +418,16 @@ poetry run python src/backtester.py --ticker AAPL,MSFT,NVDA
 ### v2 CLI（独立于 src/，见 [v2_fund_system.md](v2_fund_system.md)、[v2_signals_system.md](v2_signals_system.md)）
 
 ```bash
-# THE command：交互式建基金向导——选股票、选策略、设资金，跑第一次周期
+# THE command：交互式体验——先选 LLM 模型，再二选一：建基金 / 回测已保存的基金
 poetry run python -m v2.run
 
-# 或给一份 mandate YAML：非交互式跑一次周期，完整 CycleRecord 打印到 stdout
+# 给一份 mandate YAML：非交互式跑一次周期，完整 CycleRecord 打印到 stdout
 poetry run python -m v2.run v2/funds/example.yaml --date 2025-06-03
 
-# PEAD 回测演示仪表盘（终端实时展示，预热缓存后可离线运行）
-poetry run python -m v2.demo.backtest
+# 回测这份 mandate：run_cycle 循环整段历史，终端实时权益曲线（交互模式）或结果 JSON（非交互模式）
+poetry run python -m v2.run v2/funds/example.yaml --backtest --start 2024-01-01 --date 2025-06-03
 
-# PEAD 回测（100 只股票池）
+# 单模型回测（旧版专用工具，100 只股票池，PEAD 示例）
 poetry run python -m v2.backtesting
 
 # v2 测试
@@ -510,7 +509,7 @@ poetry run pytest -k "test_name"                       # 按名称运行测试
 - [../VISION.md](../VISION.md) — v2 愿景（fund 作为持久化对象、三种模式共用的 `run_cycle` 流水线）
 - [v2_data_layer.md](v2_data_layer.md) — v2 数据层（FDClient、FDClientError、CachedDataClient、Pydantic 模型、时点过滤）
 - [v2_signals_system.md](v2_signals_system.md) — v2 Alpha 模型与 LLM 投资人系统（AlphaModel、LLMAgent、5 位投资人人格、PEADModel、v2/llm/、FundamentalsSnapshot）
-- [v2_fund_system.md](v2_fund_system.md) — v2 Fund 系统（FundSpec/Fund、Broker/SimBroker、组合构建、风控硬限额、run_cycle 流水线、`v2.run` 统一 CLI、策略库）
+- [v2_fund_system.md](v2_fund_system.md) — v2 Fund 系统（FundSpec/Fund、Broker/SimBroker、组合构建、风控硬限额、run_cycle 流水线、backtest_fund 整支基金回测、`v2.run` 统一 CLI、策略库）
 - [v2_event_study_system.md](v2_event_study_system.md) — v2 事件研究框架（compute_car、市场模型、统计检验、可视化）
 - [v2_backtesting_system.md](v2_backtesting_system.md) — v2 回测引擎（BacktestEngine.run_alpha、绩效指标）
 

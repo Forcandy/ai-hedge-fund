@@ -1,6 +1,6 @@
 # v2 Alpha 模型与 LLM 投资人系统 (v2 Signals & LLM System)
 
-源目录: `v2/signals/`、`v2/llm/`、`v2/features/`、`v2/demo/`
+源目录: `v2/signals/`、`v2/llm/`、`v2/features/`
 
 ---
 
@@ -29,7 +29,6 @@ v2 的核心抽象是 **Alpha 模型（`AlphaModel`）**：任何对某只股票
 | `v2/llm/client.py` | `LLMClient` 协议 + `AnthropicLLM` 实现 + `extract_json` |
 | `v2/llm/cache.py` | `PromptCache`——按 prompt 内容哈希缓存 LLM 决策到磁盘 |
 | `v2/features/snapshot.py` | `FundamentalsSnapshot`——LLM Agent 的共享时点正确输入 |
-| `v2/demo/backtest.py` | PEAD 回测演示仪表盘（终端实时展示） |
 
 ---
 
@@ -355,31 +354,15 @@ from v2.signals import (
 
 ## 9. 单模型的时点观点 CLI 已并入 `v2.run`
 
-早期版本这里是独立的 `v2/analyze.py`（`poetry run python -m v2.analyze NVDA --agent buffett`）——该文件已在 v2.0.0 删除。同等能力（选一个模型、选一个 as-of 日期、看它对一只股票的时点观点）现在是 `poetry run python -m v2.run` 交互式建基金流程的一部分：建基金时选中的每个策略、每个模型都会对整个股票池跑一遍 `predict()`，并把每一条观点（方向、置信度、理由）展示在"AGENT ANALYSIS"表格里。完整的 CLI 说明见 [`v2_fund_system.md`](./v2_fund_system.md#7-v2runpy--统一-cli)。
+早期版本这里是独立的 `v2/analyze.py`（`poetry run python -m v2.analyze NVDA --agent buffett`）——该文件已在 v2.0.0 删除。同等能力（选一个模型、选一个 as-of 日期、看它对一只股票的时点观点）现在是 `poetry run python -m v2.run` 交互式建基金流程的一部分：建基金时选中的每个策略、每个模型都会对整个股票池跑一遍 `predict()`，并把每一条观点（方向、置信度、理由）展示在"AGENT ANALYSIS"表格里。完整的 CLI 说明见 [`v2_fund_system.md`](./v2_fund_system.md#8-v2runpy--统一-cli)。
 
 ---
 
-## 10. `v2/demo/backtest.py` — 演示仪表盘
+## 10. 演示仪表盘 `v2/demo/backtest.py` 已在 v2.0.1 删除
 
-```bash
-poetry run python -m v2.demo.backtest             # 预热缓存 ~20s，可离线运行
-poetry run python -m v2.demo.backtest --refresh    # 强制重新拉取数据，重建缓存
-```
+早期版本这里是一个独立的 PEAD 回测演示仪表盘（`poetry run python -m v2.demo.backtest`，固定 25 只股票、固定日期范围、终端实时权益曲线展示）。commit 说明是"Trim the backtest UX: drop attribution, date the receipts, remove the demo"——`v2/demo/` 整个目录（`__init__.py`、`backtest.py`）已被删除，`pyproject.toml` 里对应的展示层依赖没有单独变化（`rich`、`dotenv` 仍在用，只是使用方从 `demo/backtest.py` 换成了 `v2/run.py`）。
 
-面向演示场景的前端，底层驱动的是与生产环境相同的 `BacktestEngine`、`PEADModel` 与数据层——这一层只负责固定日期范围、精选 25 只股票池、节奏化的交易重放动画（终端实时仪表盘：运行统计、权益曲线、交易明细带）。
-
-| 常量 | 值 | 说明 |
-|------|-----|------|
-| `TICKERS` | 25 只精选股票（AAPL、MSFT、NVDA...） | 演示用固定股票池 |
-| `START_DATE` | `"2023-07-01"` | — |
-| `END_DATE` | `"2026-06-13"`（**固定值，非 `date.today()`**） | 避免演示当天与彩排时缓存键、统计结果不一致 |
-| `HOLDING_DAYS` | `5` | — |
-| `CAPITAL` | `100_000.0` | — |
-| `PER_TRADE` | `10_000.0` | — |
-| `EARNINGS_LIMIT` | `40` | 约 3 年的 8-K/10-Q 记录，供 PEAD 回溯 |
-| `REPLAY_SECONDS` | `18.0` | 加载 ~2s，总演示时长约 20s |
-
-所有 API 响应均通过 `CachedDataClient` 磁盘缓存：预热后每次重跑（包括正式演示当天）都完全离线，且数字与彩排时完全一致。
+同等甚至更完整的能力现在是 `poetry run python -m v2.run` 的一部分：交互式向导里选择"Backtest a fund"，会对一支已保存的基金在任意日期区间上跑真实的 `backtest_fund()`（见 [`v2_fund_system.md`](./v2_fund_system.md#7-backtest_fund--整支基金的历史回测v2backtestingfundpy)），过程中同样有终端实时权益曲线（`_BacktestBoard`，基金曲线对比基准曲线），且不再局限于固定的 25 只股票或固定的日期范围——任何一支基金、任何时间窗口都能跑。
 
 ---
 
@@ -393,19 +376,15 @@ poetry run python -m v2.demo.backtest --refresh    # 强制重新拉取数据，
 | `pandas` | RSI 等技术指标计算的价格序列输入 | `signals/base.py` |
 | `pydantic` | `Signal`、`FundamentalsSnapshot`、`PeriodFundamentals` 等模型 | `models.py`, `features/snapshot.py` |
 | `langchain-anthropic` | `AnthropicLLM` 的底层传输 | `llm/client.py` |
-| `rich` | demo 的终端富文本输出（spinner、表格、面板） | `demo/backtest.py` |
-| `dotenv`（`python-dotenv`） | 加载 `.env` | `demo/backtest.py` |
 
 ### 11.2 项目内部依赖
 
 | 模块 | 导入项 | 用途 |
 |------|--------|------|
 | `v2.data.protocol` | `DataClient` | Alpha 模型 `predict()` 的数据源协议参数 |
-| `v2.data` | `CachedDataClient`, `FDClient` | demo 的具体数据源 |
 | `v2.models` | `Signal` | Alpha 模型的统一输出类型 |
-| `v2.backtesting` | `BacktestEngine` | `demo/backtest.py` 驱动回测 |
 
-> 注：单模型 CLI 相关的 `rich`/`dotenv`/`CachedDataClient` 用法已随 `v2/analyze.py` 的删除转移到 `v2/run.py`（新增 `questionary`、`prompt_toolkit`、`pyyaml` 等依赖），见 [`v2_fund_system.md`](./v2_fund_system.md)。
+> 注：本模块自身（`v2/signals/`、`v2/llm/`、`v2/features/`）不直接依赖 `rich`/`dotenv`/`CachedDataClient`/`BacktestEngine`——那些用法原本在已删除的 `v2/analyze.py`、`v2/demo/backtest.py` 里，现已转移到 `v2/run.py`（新增 `questionary`、`prompt_toolkit`、`pyyaml` 等依赖）与 `v2/backtesting/`，见 [`v2_fund_system.md`](./v2_fund_system.md) 与 [`v2_backtesting_system.md`](./v2_backtesting_system.md)。
 
 ### 11.3 标准库
 

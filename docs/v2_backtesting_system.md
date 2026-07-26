@@ -12,7 +12,7 @@ v2 回测系统是一个**Alpha 模型无关（Alpha-Model-Agnostic）**的交�
 
 > **架构变更提示**：早期版本的 v2 回测系统曾采用 `Strategy` 抽象基类 + `PEADStrategy` + `TradeSignal` 的"批量生成信号 → 引擎执行"两阶段架构（`v2/backtesting/strategy.py`）。该文件已被删除，取而代之的是与 `v2/signals/` 模块共享的 `AlphaModel` 接口——量化模型（`QuantModel`，如 `PEADModel`）与 LLM 投资人 Agent（`LLMAgent`，如 `BuffettAgent`）现在使用同一套接口、同一个回测引擎，无需再为每种模型单独适配"生成信号"逻辑。
 >
-> **v2.0.0 补充**：本文档的 `BacktestEngine.run_alpha()` 与 [`v2_fund_system.md`](./v2_fund_system.md) 中新引入的 `run_cycle()` 是两条**并存但尚未统一**的执行路径——`run_alpha()` 针对单个 `AlphaModel` 在一批股票上做多空回测，`run_cycle()` 是"整支基金（多策略、混合、风控、执行）一次完整周期"的流水线。`ROADMAP.md` 明确把两者的收敛列为下一步（"backtest/paper convergence next"），本文档描述的仍是当前独立可用的回测引擎，尚未被 `run_cycle` 取代。
+> **v2.0.1 补充**：`ROADMAP.md`/`VISION.md` 已把"回测/`run_cycle` 收敛"标为完成——`v2/backtesting/fund.py` 新增的 `backtest_fund()`（见 [`v2_fund_system.md`](./v2_fund_system.md#7-backtest_fund--整支基金的历史回测v2backtestingfundpy)）现在就是 `run_cycle` 循环整段历史的那条统一路径，也是 `VISION.md` 里"backtest = run_cycle over history with a SimBroker"承诺的落地。本文档描述的 `BacktestEngine.run_alpha()` 是更早期的、单个 `AlphaModel` 专用的回测工具，`VISION.md` 明确说明它作为"单模型研究用的旧版专用工具"被保留下来，两者并存但服务不同用例：`run_alpha()` 只回测一个模型在一批股票上的多空表现，不涉及多策略混合、风控裁剪或基金层面的执行；`backtest_fund()` 跑的是一整支基金（策略混合 + 风控 + 执行）的完整周期。
 
 ### 1.2 设计目标
 

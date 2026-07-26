@@ -1,8 +1,8 @@
 # v2 Fund 系统 (Fund / Strategy / Portfolio / Risk / Execution)
 
-源目录: `v2/fund/`、`v2/brokers/`、`v2/portfolio/`、`v2/risk/`、`v2/pipeline/`、`v2/strategies/`、`v2/funds/`、`v2/run.py`
+源目录: `v2/fund/`、`v2/brokers/`、`v2/portfolio/`、`v2/risk/`、`v2/pipeline/`、`v2/backtesting/fund.py`、`v2/strategies/`、`v2/funds/`、`v2/run.py`
 
-> **v2.0.0 新增模块**。这是继 [`v2_signals_system.md`](./v2_signals_system.md)（Alpha 模型层）之后，v2 在 2026-07 合并的第二批核心组件——把"单个模型形成观点"接到了"一整支基金的一次完整交易周期"。`ROADMAP.md` 中 `run_cycle`、`Fund` 对象、`Strategy`/组合构建、`Broker` 协议均从 `⬜ 规划中` 升级为 `✅`/`🚧`。
+> **v2.0.0 新增模块，v2.0.1 补上"回测整支基金"**。这是继 [`v2_signals_system.md`](./v2_signals_system.md)（Alpha 模型层）之后，v2 在 2026-07 合并的核心组件——把"单个模型形成观点"接到了"一整支基金的一次完整交易周期"，再接到了"这条流水线循环整段历史"。`ROADMAP.md` 中 `run_cycle`、`Fund` 对象、`Strategy`/组合构建、`Broker` 协议、回测引擎均已从 `⬜ 规划中` 升级为 `✅`/`🚧`。
 
 ---
 
@@ -35,6 +35,7 @@ MODEL     =  一个 Alpha 模型 → 一个 Signal（[-1,+1] 信念值 + 论点�
 | `v2/pipeline/run_cycle.py` | `run_cycle()`——一次完整周期的唯一代码路径 |
 | `v2/pipeline/execution.py` | `build_orders()`——把目标权重与当前持仓做差，生成订单 |
 | `v2/pipeline/models.py` | `CycleRecord`、`StrategyRecord`、`TickerSkip`——一次周期的完整可序列化记录 |
+| `v2/backtesting/fund.py` | `backtest_fund()`——`run_cycle` 循环整段历史，`FundBacktestResult`/`rebalance_grid()` |
 | `v2/strategies/*.yaml` | 策略库（`fundamental-ls`、`deep-value`、`inflections`、`earnings-drift`） |
 | `v2/funds/example.yaml` | 示例基金 mandate |
 | `v2/run.py` | 统一 CLI：交互式建基金向导 + 非交互式跑一次周期 |
@@ -91,6 +92,8 @@ StrategySpec(
 | `strategies` | `list[StrategySpec]`（至少 1 个） | `@field_validator` 检查策略名不重复 |
 | `risk` | `RiskLimits` | **主风控**——应用在所有策略合并、净仓之后的总账本上（见第 4 节） |
 | `capital` | `float`（`> 0`） | 默认 `100_000.0` |
+| `rebalance` | `Literal["daily","weekly","monthly"]` | 默认 `"weekly"`。多久跑一次周期——是 mandate 的选择，不是引擎常量：基本面驱动的基金按周调仓，新闻驱动的基金可以按天。回测器（以及未来的调度守护进程）会遵守它，`run_cycle` 本身从不感知这个字段 |
+| `benchmark` | `str` | 默认 `"SPY"`。基金拿什么做基准对比；同时也是回测时交易日网格的来源。`@field_validator` 自动转大写 |
 
 全字段 `extra="forbid"`：YAML 里的拼写错误在加载时（而非交易时）就会报错。
 
@@ -276,38 +279,115 @@ def build_orders(target_weights, positions, marks, equity) -> list[Order]
 
 ---
 
-## 7. `v2/run.py` — 统一 CLI
+## 7. `backtest_fund` — 整支基金的历史回测（`v2/backtesting/fund.py`）
 
-早期分立的 `v2/analyze.py`（单模型问一只股票）和"跑一次回测"逻辑，在 v2.0.0 合并成唯一入口 `v2.run`。两种用法背后是**同一套引擎**：交互式向导只是"组装一份 `FundSpec`"的瘦客户端——同样机器可读的 YAML，人可以点选生成，未来 chat LLM 或策略生成器也能生成，引擎只认一种格式。
+**`run_cycle` 文档字符串许下的承诺**："a backtest is run_cycle in a loop over history with a SimBroker"——这个模块就是那个循环。这里不重新实现任何流水线逻辑：每一个 tick 都是对一个持久化 `SimBroker` 真实调用一次 `run_cycle`，所以任何对单次周期成立的性质（时点正确数据、fail-loud 定价、净仓上的主风控）对回测中的每一个 tick 都天然成立。这是 `engine.py`（`BacktestEngine`，单个 Alpha 模型的回测，见 [`v2_backtesting_system.md`](./v2_backtesting_system.md)）在基金层面的对应物——`BacktestEngine` 用固定机制模拟单个模型的观点，`backtest_fund` 跑的是整个"店"。
 
-### 7.1 非交互模式——跑一次周期
+> **ROADMAP 补充**：这次合并（`v2.0.1`）把 `run_cycle`/回测收敛的路线图项标为已完成——`backtest_fund` 就是 `run_cycle` 循环历史的那条统一路径；`BacktestEngine.run_alpha()`（`v2/backtesting/engine.py`）作为单模型研究用的旧版专用工具保留下来，两者并存，服务不同的用例。
+
+### 7.1 `backtest_fund(fund, start, end, data_client, *, on_cycle=None) -> FundBacktestResult`
+
+```python
+bars = data_client.get_prices(spec.benchmark, start, end)
+closes = {日期: 收盘价, ...}          # 限定在 [start, end] 内
+grid = rebalance_grid(sorted(closes), spec.rebalance)   # 按调仓频率抽取交易日
+```
+
+- **交易日网格来自 mandate 的基准的真实 K 线**，而不是自己实现交易所日历——节假日、缩短的交易周自然就被排除了
+- **fail-loud**：基准在 `[start, end]` 窗口内一根 K 线都没有就直接 `raise ValueError`——没有交易网格的回测是基础设施问题，不是"空结果"
+- 用**同一个持久化 `SimBroker`** 依次对 `grid` 里的每个日期调用一次 `run_cycle`——持仓和现金跨 tick 延续，基金是在"调仓"而不是每次都从零开始
+- `on_cycle(i, n, record)`：每个 tick 结束后触发一次的回调，供进度 UI 使用（见 8.4 节的 `_BacktestBoard`）
+- 逐 tick 收集 `nav`（基金净值）与 `benchmark_nav`（基准按同样起始资本换算后的净值，`capital * close_t / close_grid[0]`）
+
+### 7.2 `rebalance_grid(days, cadence) -> list[str]`
+
+从已排序的交易日列表中挑出调仓日：
+
+| `cadence` | 规则 |
+|-----------|------|
+| `"daily"` | 每个交易日都算 |
+| `"weekly"` | 每个 ISO 周的最后一个交易日 |
+| `"monthly"` | 每个自然月的最后一个交易日 |
+
+实现上按 `(年, 周)` 或 `(年, 月)` 分组，由于输入已排序，同一组内后写入的日期会覆盖前一个，天然取到"最后一个交易日"。
+
+### 7.3 `FundBacktestMetrics` 与 `FundBacktestResult`
+
+| `FundBacktestMetrics` 字段 | 说明 |
+|---------------------------|------|
+| `total_return_pct` / `annualized_return_pct` | 总收益率 / 年化收益率 |
+| `sharpe_ratio` | 按每期（而非每日）收益率计算，用 `_PERIODS_PER_YEAR[cadence]`（`daily=252`、`weekly=52`、`monthly=12`）年化；样本数 `<=1` 或标准差为 0 时取 `0.0` |
+| `max_drawdown_pct` | 对 `[起始资本] + nav` 曲线做历史峰值追踪，逻辑与 `BacktestEngine._compute_metrics` 一致 |
+| `benchmark_return_pct` | 基准在同一窗口的总收益率 |
+| `excess_return_pct` | 基金总收益率减基准总收益率 |
+| `n_cycles` | 回测跑了多少个周期 |
+| `n_orders` | 全部周期加总的下单数 |
+
+`FundBacktestResult`（顶层结果，`model_dump_json()` 可完整往返——"收据文件"）：`fund`、`start`/`end`（实际交易的第一/最后一个网格日期）、`rebalance`、`benchmark`、`capital`、`dates`、`nav`（每个 tick 后的基金净值）、`benchmark_nav`、`metrics`、`records`（**每一个 tick 的完整 `CycleRecord`**——因此这份结果里包含了每次调仓背后的每一条论点、每一次风控裁剪、每一笔订单与成交）。
+
+---
+
+## 8. `v2/run.py` — 统一 CLI
+
+早期分立的 `v2/analyze.py`（单模型问一只股票）在 v2.0.0 合并进唯一入口 `v2.run`；v2.0.1 又把"回测一整支基金"也并了进来（`v2/demo/` 的独立演示仪表盘随之被删除，见 [`v2_signals_system.md`](./v2_signals_system.md)）。三种用法背后是**同一套引擎**：交互式向导只是"组装一份 `FundSpec`"的瘦客户端——同样机器可读的 YAML，人可以点选生成，未来 chat LLM 或策略生成器也能生成，引擎只认一种格式。
+
+### 8.1 非交互模式——跑一次周期或跑一次回测
 
 ```bash
+# 跑一次周期
 poetry run python -m v2.run v2/funds/example.yaml --date 2025-06-03
+
+# 回测这份 mandate：从 --start 到 --date，按 mandate 的调仓频率跑 run_cycle
+poetry run python -m v2.run v2/funds/example.yaml --backtest --start 2024-01-01 --date 2025-06-03
+
+# 指定 LLM 投资人 Agent 使用的模型
+poetry run python -m v2.run v2/funds/example.yaml --model claude-opus-5
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `mandate`（位置参数，可省略） | — | 基金 mandate YAML 路径；省略则进入交互式向导 |
-| `--date` | 今日 | as-of 日期；模型只能看到这一天之前已公开申报的数据 |
-| `--out` | — | 额外把 `CycleRecord` JSON 写入这个文件 |
+| `--date` | 今日 | as-of 日期（单周期模式）；模型只能看到这一天之前已公开申报的数据 |
+| `--backtest` | `False`（flag） | 不跑单次周期，改为回测：从 `--start` 到 `--date` 按 mandate 的 `rebalance` 频率逐一调用 `run_cycle` |
+| `--start` | `--date` 往前 `_BACKTEST_WEEKS`（78 周，约 18 个月） | 回测起始日期，仅 `--backtest` 时有效 |
+| `--model` | — | LLM 投资人 Agent 使用的模型（如 `claude-opus-5`）；设置后写入环境变量 `V2_LLM_MODEL`，被 `AnthropicLLM` 读取为覆盖值；量化模型忽略此参数 |
+| `--out` | — | 额外把结果 JSON 写入这个文件 |
 
-行为：`load_spec()` 加载 mandate → `Fund(spec)` → `SimBroker(cash=spec.capital)` → `CachedDataClient(FDClient())` → `run_cycle()`。**完整的 `CycleRecord` JSON 打印到 stdout**（可管道给其他工具），进度 spinner 和人类可读摘要打印到 stderr——两者分离是为了让 stdout 保持纯净的 JSON。
+单周期行为：`load_spec()` → `Fund(spec)` → `SimBroker(cash=spec.capital)` → `CachedDataClient(FDClient())` → `run_cycle()`。回测行为：同样加载 `Fund` 后调用 `backtest_fund()`（见第 7 节）。**完整结果 JSON（`CycleRecord` 或 `FundBacktestResult`）打印到 stdout**（可管道给其他工具），进度 spinner 和人类可读摘要打印到 stderr——两者分离是为了让 stdout 保持纯净的 JSON。
 
-### 7.2 交互模式——建基金向导（无参数）
+### 8.2 交互模式——两件事，一支基金（无参数）
 
 ```bash
 poetry run python -m v2.run
 ```
 
-一个小型状态机，四步（每步可按 `Esc` 回退一步）：
+打开后**首先**问一次"投资人 Agent 用哪个模型推理"（`_pick_model`）：
+
+| 选项 | 模型 ID | 说明 |
+|------|---------|------|
+| Opus 5（默认） | `claude-opus-5` | 能力最强 |
+| Sonnet 5 | `claude-sonnet-5` | 均衡档，非最贵档 |
+
+选定后写入 `V2_LLM_MODEL` 环境变量，之后无论是名册预热、正式建基金还是回测，全部 `LLMAgent` 实例统一走这一个模型（量化模型 PEAD 不受影响）。选择模型这一步按 `Esc`/`Ctrl-C` 会直接退出整个交互流程。
+
+再进入主菜单，二选一（"production 与 research lab 并列"，`VISION.md` 的说法）：
+
+- **Build a fund**——走建基金向导，见 8.3 节
+- **Backtest a fund**——从已保存的基金里选一个回测，见 8.4 节
+
+`Esc` 在主菜单处直接退出；在某个具体流程里按 `Esc` 回到主菜单。
+
+### 8.3 Build a fund——建基金向导
+
+一个小型状态机，**五步**（每步可按 `Esc` 回退一步，比 v2.0.0 多了第 5 步"调仓频率"）：
 
 1. **`_step_name`**：基金名（自动转小写、空格转连字符）
 2. **`_step_tickers`**：股票池（逗号或空格分隔，自动去重、转大写）
 3. **`_step_strategies`**：从 `v2/strategies/*.yaml` 策略库里勾选（含一个"Build your own"选项，可以逐个手选模型，哪怕只选 PEAD 一个）
 4. **`_step_capital`**：起始资金
+5. **`_step_cadence`**：调仓频率，`daily`/`weekly`/`monthly` 三选一，默认 `weekly`
 
-四步结束后：按等额资金切片组装 `FundSpec`（`risk` 用固定的 `DEFAULT_RISK = {max_position_pct: 0.25, max_gross_exposure: 1.0}`），写入 `v2/funds/{name}.yaml`（该目录已加入 `.gitignore`，只保留 `example.yaml` 被跟踪），询问是否立即跑第一次周期。
+五步结束后：按等额资金切片组装 `FundSpec`（`risk` 用固定的 `DEFAULT_RISK = {max_position_pct: 0.25, max_gross_exposure: 1.0}`；`rebalance` 取第 5 步的选择），写入 `v2/funds/{name}.yaml`（该目录已加入 `.gitignore`，只保留 `example.yaml` 被跟踪），询问是否立即跑第一次周期。
 
 **跑第一次周期时的"名册"UI（`_run_with_roster`）**：先用线程池并发"预热"——每个 Agent 对股票池里的每只票调用一次 `predict()`（只是为了把磁盘缓存焐热，异常被吞掉，不作为真相来源），终端上以 v1 风格显示每个 Agent 的实时状态（`⋯ 排队中` → `⋯ [TICKER] 分析中` → `✓ 完成`）；预热结束后，用一个**全新的** `Fund` 实例和 `SimBroker` 正式跑一次 `run_cycle`——这次读到的全是刚焐热的缓存，瞬间完成，且是唯一的真相来源（fail-loud 错误在这里才会真正出现，不在预热阶段）。
 
@@ -317,13 +397,40 @@ poetry run python -m v2.run
 3. **ORDERS**：买/卖、数量、ticker、价格
 4. **PORTFOLIO SUMMARY**：逐 ticker 多空方向、股数、市值、权重，外加 NAV、现金、总敞口（gross）、净敞口（net）
 
-### 7.3 版本号
+### 8.4 Backtest a fund——研究实验室
 
-`v2/run.py` 顶部硬编码 `VERSION = "2.0.0"`（注释注明需要与 `pyproject.toml` 保持同步）——这与 v2.0.0 这次合并把项目版本号从日历式（`2026.7.10`）改为语义化版本（`2.0.0`）一致。
+`_backtest_saved_fund`：从 `v2/funds/*.yaml` 里挑一支已保存的基金，接着走一个四步状态机（复用同一套 `Esc` 回退状态机模式）：
+
+1. **`_step_pick_fund`**：从已保存的基金 mandate 里选一个（用 `_fund_label` 显示名称、股票池前 4 只、调仓频率）
+2. **`_step_tickers`**：预填该基金保存的股票池，本次运行可以临时增删（不修改原 YAML）
+3. **`_step_backtest_start`**：回测起始日期，默认今日往前 78 周
+4. **`_step_backtest_end`**：回测截止日期，需晚于起始日期
+
+四步完成后，用 `spec.model_copy(update={"universe": ...})` 生成一份**不改动原 YAML 的临时 spec**（浅拷贝、不重新校验），跑 `_run_backtest`。
+
+**`_run_backtest` 的两阶段预热 + 回放**：
+
+1. **`_warm_market_data`**：先并发预取 `run_cycle` 和快照构建将会用到的全部请求（按 `(ticker, 日期分块)` 切任务而非按 ticker 切——这样即使只有一只股票，78 周的历史也能被多个线程同时抓取，而不是全压在一个线程上），用 `rich.Progress` 条显示"Loading market data · N stocks × M cycles"
+2. **`_warm_agents`**：名册 UI 在整个历史窗口上重放一遍（每个 Agent × 每个调仓日 × 每只股票各 `predict()` 一次），把 prompt 缓存焐热；这一阶段**没有 dwell 延迟**——未变化的快照是瞬间命中缓存，真正发生的新 LLM 调用自然会让名册的节奏慢下来，不需要人为节流
+3. 用**全新的** `Fund` + `_BacktestBoard`（见 8.5 节）跑真正的 `backtest_fund(..., on_cycle=board.tick)`——这是唯一的真相来源
+
+跑完后：`_print_backtest` 打印结果表格（见 8.6 节），并把完整的 `FundBacktestResult` JSON 存到 `v2/funds/{name}-backtest-{YYYY-MM-DD-HHMMSS}.json`（按时间戳命名，重跑同一支基金不会覆盖旧的"收据"）。
+
+### 8.5 `_BacktestBoard`——回测时的实时权益曲线
+
+回放过程中的 Live 仪表盘：顶部四格统计（组合市值、基金收益率、基准收益率、最大回撤），下方是**双线 Unicode 折线图**（`_render_chart`）——基金曲线与基准曲线画在同一组坐标轴上，基金线后画、颜色随盈亏变绿/变红（相对起始资本），基准线固定青色；左侧一列价格刻度（`_money`，超过一万自动显示为 `$xxxk`）。每个 tick 之间有 `_CYCLE_DWELL`（0.08 秒）的最小停留，让曲线"画出来"的过程肉眼可见而不是一闪而过。
+
+### 8.6 `_print_backtest`——最终结果表
+
+一张表：Total Return、Annualized、Sharpe（`>1` 绿色、`>0` 黄色、其余红色）、Max Drawdown、`{benchmark} Return`、Excess（基金减基准，正绿负红）。标题栏附带日期范围、调仓频率、周期数、订单总数。
+
+### 8.7 版本号
+
+`v2/run.py` 顶部硬编码 `VERSION = "2.0.0"`（注释注明需要与 `pyproject.toml` 保持同步；`pyproject.toml` 已升级到 `2.0.1`，这处硬编码尚未跟着更新）——这与合并把项目版本号从日历式（`2026.7.10`）改为语义化版本一致。
 
 ---
 
-## 8. 策略库与示例基金（`v2/strategies/`、`v2/funds/`）
+## 9. 策略库与示例基金（`v2/strategies/`、`v2/funds/`）
 
 策略库是"不需要写代码"的贡献方式：把已有模型打包成一个带混合策略的 YAML，扔进 `v2/strategies/`，建基金向导会自动识别。当前 4 个：
 
@@ -340,7 +447,7 @@ poetry run python -m v2.run
 
 ---
 
-## 9. 依赖关系
+## 10. 依赖关系
 
 ### 9.1 外部 Python 包
 
